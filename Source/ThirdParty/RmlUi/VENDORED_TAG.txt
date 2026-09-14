@@ -475,3 +475,76 @@ Mac fails without the includes exactly as above (va-macbook
 NOT yet offered upstream -- same standing as patches #1-#5. Checked against
 mikke89/RmlUi master 2026-08-11: both headers still carry the forward-declaration-
 only pattern, so the defect is live upstream for any strict-libc++ consumer.
+
+
+Patch #7 -- a transformed stacking context never re-dirties elements that join it later.
+
+Applied 2026-09-14, backporting upstream RmlUi commit 6df503c ahead of our own next
+re-vendor.
+
+Symptom: an element revealed by a display/visibility change, or freshly inserted,
+underneath an ancestor with its own `transform` renders unscaled -- full size, at its
+untransformed position -- instead of picking up the ancestor's resolved matrix. A
+VaCuus document hits this whenever a `data-if` (inline `display: none`) or a
+`data-for` clone appears inside a scaled panel after that panel's transform already
+resolved.
+
+Cause, in this vendored tree:
+- `Element::UpdateTransformState` propagates a changed matrix only to the CURRENT
+  `stacking_context` members (Source/Core/Element.cpp:3030-3034, pre-patch), and only
+  runs that propagation at all when the container's OWN transform is dirty
+  (Source/Core/Element.cpp:2890-2891, pre-patch, is the early-out on that check);
+- `AddToStackingContext` skips invisible elements (Source/Core/Element.cpp:2390-2391,
+  pre-patch), and `visible` is false while `display: none` applies, so a newly-shown
+  element was never a stacking_context member while it was hidden and therefore never
+  reached by that propagation either;
+- `SetParent` dirties transform state only when self or parent already has a
+  `transform_state` (Source/Core/Element.cpp:2190-2192), which a freshly-inserted or
+  newly-visible element does not yet have;
+- `BuildLocalStackingContext` rebuilds the `stacking_context` list (on DOM insert/
+  remove, display/visibility/z-index change) without dirtying anyone
+  (Source/Core/Element.cpp:2362-2373, pre-patch).
+So an element that joins its ancestor's stacking context after that ancestor already
+resolved its own matrix is added to the list but never told to recompute -- it keeps
+whatever transform state it had before (usually none, i.e. identity).
+
+The change: `Element::BuildLocalStackingContext` now dirties every member of the
+freshly-rebuilt `stacking_context`, but only when the element already carries a
+`transform_state` (i.e. is itself transformed or inherits one) --
+
+	// If the stacking context changed, any previously hidden elements may not have had their transforms updated. Ensure they will be updated now.
+	if (transform_state)
+	{
+		for (Element* child : stacking_context)
+			child->DirtyTransformState(false, true);
+	}
+
+Upstream reference: mikke89/RmlUi commit 6df503c (2026-08-16), "Fix transform not
+being applied after element turns visible, see #982". Upstream's commit adds doctest
+`Element.TransformStateAfterVisibilityChange` covering this same path; this tree does
+not vendor RmlUi's Tests/ directory at all (see "What is here, and why exactly this"
+above), so that doctest is not carried here verbatim.
+
+Cost: the added loop runs only for containers that already have a `transform_state`,
+and only when that container's stacking context is actually rebuilt
+(`stacking_context_dirty`, set on DOM insert/remove, display/visibility/z-index
+change) -- not every frame. Each affected member then recomputes its own matrix once,
+on its next render.
+
+VERIFICATION (the re-vendoring check): automation test
+VaCuus.Render.Transform.AfterVisibilityChange
+(Source/VaCuusRender/Private/Tests/VaCuusTransformVisibilityTest.cpp) renders a
+`#window` with `transform: scale(2)` containing an always-visible reference pane and a
+pane that starts `display: none`, flips it to `display: block` one frame after the
+window's scale has already resolved, and asserts the newly-shown pane's transform
+then matches the reference pane's (both under `#window`'s resolved transform)
+rather than reading identity -- read through the recorded
+RenderInterface::SetTransform stream (FVaCuusRecordingRenderInterface), since
+TransformState itself is a private, unexported RmlUi type this test's module cannot
+link against directly. Revert this hunk and the final assertion fails: the pane draws
+at its correct, unscaled layout position under an explicit identity transform instead
+of the parent's scale.
+
+Drop this patch when RmlUi is re-vendored at or after 6df503c; at that point diff the
+re-vendored Element.cpp against this hunk before removing it, in case the upstream
+form has moved.
