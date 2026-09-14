@@ -27,7 +27,10 @@ Local patches
 This tree was byte-identical to the upstream commit above until 2026-08-03.
 Re-vendoring procedure: copy the file list above from the pinned commit, reapply
 the patch(es) below, then run the verification named with each one -- a patch
-that is silently lost re-introduces a defect nobody can see on screen.
+that is silently lost re-introduces a defect nobody can see on screen. A patch
+whose entry names the upstream commit it backports (#7 is the first) is DROPPED,
+not reapplied, once the pinned SHA is at or after that commit; its verification
+must still pass, and a doubled hunk is exactly what it cannot see.
 
 Patch #1 -- data-style compares against the unit-less variant (bead VaCuus-akj.17).
 
@@ -478,39 +481,67 @@ only pattern, so the defect is live upstream for any strict-libc++ consumer.
 
 
 Patch #7 -- a transformed stacking context never re-dirties elements that join it later.
+Backport of upstream mikke89/RmlUi 6df503c; EXPIRES at the first re-vendor at or after
+it (bead VaCuus-74s).
 
-Applied 2026-09-14, backporting upstream RmlUi commit 6df503c ahead of our own next
-re-vendor.
+Applied 2026-09-14 from PR #2, ahead of our own next re-vendor, with the corrections of
+bead VaCuus-kga. Element.cpp line numbers in this entry and in its test are for THIS
+tree, with the hunk applied; upstream's pre-patch numbers are 7 lower from line 2380 on.
 
-Symptom: an element revealed by a display/visibility change, or freshly inserted,
-underneath an ancestor with its own `transform` renders unscaled -- full size, at its
-untransformed position -- instead of picking up the ancestor's resolved matrix. A
-VaCuus document hits this whenever a `data-if` (inline `display: none`) or a
-`data-for` clone appears inside a scaled panel after that panel's transform already
-resolved.
+Symptom: an element that becomes visible underneath an ancestor with its own
+`transform` renders unscaled -- full size, at its untransformed layout position --
+instead of picking up the ancestor's resolved matrix. A VaCuus document hits this
+whenever a `data-if` (inline `display: none`, DataViewDefault.cpp:259-261) flips true
+inside a panel whose transform already resolved; and, by a second route, whenever a
+`data-for` clone is created inside such a panel: the clone's own box scales, the
+content filled into it does not. The same missing state breaks hit-testing for those
+elements too: the interactive snapshot gates its projected path on GetTransformState()
+(Source/VaCuusRender/Private/VaCuusInteractiveSnapshot.cpp:432), so the untransformed
+rect is what the game thread hit-tests -- consistently wrong on both channels.
 
 Cause, in this vendored tree:
-- `Element::UpdateTransformState` propagates a changed matrix only to the CURRENT
-  `stacking_context` members (Source/Core/Element.cpp:3030-3034, pre-patch), and only
-  runs that propagation at all when the container's OWN transform is dirty
-  (Source/Core/Element.cpp:2890-2891, pre-patch, is the early-out on that check);
-- `AddToStackingContext` skips invisible elements (Source/Core/Element.cpp:2390-2391,
-  pre-patch), and `visible` is false while `display: none` applies, so a newly-shown
-  element was never a stacking_context member while it was hidden and therefore never
-  reached by that propagation either;
-- `SetParent` dirties transform state only when self or parent already has a
-  `transform_state` (Source/Core/Element.cpp:2190-2192), which a freshly-inserted or
-  newly-visible element does not yet have;
-- `BuildLocalStackingContext` rebuilds the `stacking_context` list (on DOM insert/
-  remove, display/visibility/z-index change) without dirtying anyone
-  (Source/Core/Element.cpp:2362-2373, pre-patch).
-So an element that joins its ancestor's stacking context after that ancestor already
-resolved its own matrix is added to the list but never told to recompute -- it keeps
-whatever transform state it had before (usually none, i.e. identity).
+- The only way a member of a transformed stacking context gets its matrix is the
+  propagation loop at the end of `Element::UpdateTransformState`
+  (Element.cpp:3037-3041): it runs over the CURRENT `stacking_context` members, and
+  only when the container's matrix actually CHANGED in this render
+  (`perspective_or_transform_changed`, :3037). It is not gated by the dirty flag.
+  `dirty_transform` is sticky -- the only write is the `|=` at :2892, with no
+  `= false` twin of the perspective reset at :2953 -- so a container that ever held a
+  matrix recomputes its (unchanged) matrix on every render for life, propagating
+  nothing, and the early-out at :2897 is only ever taken by an element that has NEVER
+  been dirtied. Dirtying the container from the visibility path is therefore not an
+  alternative fix: it is already dirty.
+- `AddToStackingContext` skips invisible elements (Element.cpp:2397-2398), and
+  `visible` is false under `display: none` and `visibility: hidden` alike (:1856-1857),
+  so a hidden element was not a member while the container's matrix resolved, and the
+  one propagation that would have reached it has already happened.
+- `SetParent` dirties a newly-parented element only when it or its NEW PARENT already
+  holds a transform_state (Element.cpp:2190-2192). Every rendered member of a
+  transformed subtree holds one (:3002-3028 copies the stacking parent's matrix into
+  each member's own state), so a leaf inserted under a rendered member IS dirtied and
+  renders correctly without this patch -- that is not the bug, and a test that inserts
+  a leaf passes with the hunk reverted (AfterLateInsert keeps one as its control). The
+  insert that fails is content under a parent that has not rendered yet, which is what
+  DataViewFor::Update does to every clone: InsertBefore (DataViewDefault.cpp:544;
+  dirtied, its parent has a state) and then SetInnerRML (:548) while the clone's own
+  state is still null, so the content is parented without a dirty. The clone's first
+  render then propagates over ITS `stacking_context`, which is empty because a plain
+  block is not a stacking-context container -- the content lives in the CONTAINER's
+  flat list -- and the content renders under identity.
+- `BuildLocalStackingContext` rebuilds the flat member list on every DOM insert/remove
+  and every display/visibility/z-index change (`DirtyStackingContext` marks the closest
+  container, Element.cpp:2489-2493) without dirtying anyone (:2362-2372, the body
+  before the hunk), and is reached from two places: `Element::Render` (:188-189, before
+  that element's own UpdateTransformState at :191) and `Context::GetElementAtPoint`
+  (Context.cpp:1407-1408, the hover and input paths, during Update).
+So an element that joins the container's stacking context after the container's matrix
+last changed is added to the list and never told to compute -- it keeps whatever state
+it had, which for a hidden-from-birth or freshly-created element is none, i.e. identity.
+The reverse direction self-heals: an element that once held a matrix stays dirty and
+recomputes each render, which is also why the hunk's one-directional guard is enough.
 
-The change: `Element::BuildLocalStackingContext` now dirties every member of the
-freshly-rebuilt `stacking_context`, but only when the element already carries a
-`transform_state` (i.e. is itself transformed or inherits one) --
+The change: `Element::BuildLocalStackingContext` (:2373-2379) now dirties every member
+of the freshly-rebuilt list whenever the container itself holds a transform_state --
 
 	// If the stacking context changed, any previously hidden elements may not have had their transforms updated. Ensure they will be updated now.
 	if (transform_state)
@@ -520,31 +551,56 @@ freshly-rebuilt `stacking_context`, but only when the element already carries a
 	}
 
 Upstream reference: mikke89/RmlUi commit 6df503c (2026-08-16), "Fix transform not
-being applied after element turns visible, see #982". Upstream's commit adds doctest
-`Element.TransformStateAfterVisibilityChange` covering this same path; this tree does
-not vendor RmlUi's Tests/ directory at all (see "What is here, and why exactly this"
-above), so that doctest is not carried here verbatim.
+being applied after element turns visible, see #982". The Element.cpp hunk here is
+byte-identical to upstream's. The rest of that commit is a comment typo in
+TransformState.h and doctest support under Tests/, which this tree does not vendor
+(see "What is here, and why exactly this" above); the doctest is ported as an
+automation test instead, below.
 
-Cost: the added loop runs only for containers that already have a `transform_state`,
-and only when that container's stacking context is actually rebuilt
-(`stacking_context_dirty`, set on DOM insert/remove, display/visibility/z-index
-change) -- not every frame. Each affected member then recomputes its own matrix once,
-on its next render.
+Cost: no element changes cost class. Every member that already rendered correctly was
+already sticky-dirty and recomputing every render; the loop only adds the previously
+wrong-rendering members to that set, at one bool OR per member per rebuild. The rebuild
+runs only while `stacking_context_dirty` is set, not every frame, but the list it walks
+is the FLAT one (AddChildrenToStackingContext recurses through every descendant that is
+not itself a stacking-context container), so a rebuild of a large transformed panel
+touches all of its descendants. The GetElementAtPoint rebuild can run the loop during
+Update; that only sets flags -- matrices are computed in Render, after layout -- so it
+is benign.
 
-VERIFICATION (the re-vendoring check): automation test
-VaCuus.Render.Transform.AfterVisibilityChange
-(Source/VaCuusRender/Private/Tests/VaCuusTransformVisibilityTest.cpp) renders a
-`#window` with `transform: scale(2)` containing an always-visible reference pane and a
-pane that starts `display: none`, flips it to `display: block` one frame after the
-window's scale has already resolved, and asserts the newly-shown pane's transform
-then matches the reference pane's (both under `#window`'s resolved transform)
-rather than reading identity -- read through the recorded
-RenderInterface::SetTransform stream (FVaCuusRecordingRenderInterface), since
-TransformState itself is a private, unexported RmlUi type this test's module cannot
-link against directly. Revert this hunk and the final assertion fails: the pane draws
-at its correct, unscaled layout position under an explicit identity transform instead
-of the parent's scale.
+One-frame consequence for VaCuus, noted so nobody files it as a regression: the
+interactive snapshot is built between Update() and Render()
+(Source/VaCuusRender/Private/VaCuusRmlDocumentHost.cpp:640-672), and the newly-shown
+element's transform_state appears in that frame's Render, so on the reveal frame the
+snapshot hit-tests the untransformed rect and converges on the next. It is the same lag
+any transform property change already has (OnPropertyChange dirties,
+Element.cpp:1962-1963; Render computes). Before this patch the two channels were
+wrong-but-consistent forever.
 
-Drop this patch when RmlUi is re-vendored at or after 6df503c; at that point diff the
-re-vendored Element.cpp against this hunk before removing it, in case the upstream
-form has moved.
+VERIFICATION (the re-vendoring check): two automation tests in
+Source/VaCuusRender/Private/Tests/VaCuusTransformVisibilityTest.cpp, both reading the
+recorded RenderInterface::SetTransform stream (FVaCuusRecordingRenderInterface) -- the
+file header says why that seam and not GetTransformState(). Each has a positive control
+(an always-visible reference pane, seen to draw under a non-identity matrix) and
+compares every target against the reference's recorded matrix in the same frame.
+- VaCuus.Render.Transform.AfterVisibilityChange, the port of upstream's doctest
+  `Element.TransformStateAfterVisibilityChange` with both of its SUBCASEs:
+  `#window { transform: scale(2) }` holds the reference, a `display: none` pane and a
+  `visibility: hidden` pane; one frame after the scale resolved both are shown and
+  must draw under the reference's matrix.
+- VaCuus.Render.Transform.AfterLateInsert, the data-for shape: after frame 1 a leaf is
+  appended straight under #window (the control -- correct with or without the hunk,
+  see the SetParent bullet) and a wrapper is appended and then filled with SetInnerRML;
+  the nested pane must draw under the reference's matrix.
+Restore-the-bug, Linux clang, 2026-09-14, with ONLY the Element.cpp hunk reverted and
+the tests unchanged: AfterVisibilityChange fails exactly its four matrix assertions
+("draws under pane_reference's matrix" and "draws under a non-identity transform", for
+pane_display and for pane_visibility); AfterLateInsert fails exactly the same two for
+pane_nested while both of pane_direct's hold; every positive control and every "does
+not draw while hidden" check still passes. Hunk restored: both Success. The PR author
+saw the display case fail and pass the same way on UE 5.8 Win64.
+
+Drop this patch when RmlUi is re-vendored at or after 6df503c. Reapplying it on top of
+an upstream tree that already carries it doubles the loop with nothing to flag it:
+DirtyTransformState is an idempotent OR (Element.cpp:2891-2892) and both tests pass
+either way. Diff the re-vendored BuildLocalStackingContext against the hunk first, in
+case the upstream form has moved, then remove this entry (bead VaCuus-74s).

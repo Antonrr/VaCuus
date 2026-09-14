@@ -661,6 +661,14 @@ void FVaCuusRmlDocumentHost::RecordAndPublishFrame()
 	// command buffer travels via ENQUEUE_RENDER_COMMAND, so the game thread can hit-test the
 	// new geometry a frame before the matching pixels land. The gate neither creates nor
 	// widens that; it is the cost of the two channels being independent.
+	//
+	// REVEAL-FRAME SKEW, since RmlUi Patch #7 (Source/ThirdParty/RmlUi/VENDORED_TAG.txt): an element
+	// shown or created inside a transformed ancestor gets its transform_state in THIS frame's Render(),
+	// below, after this walk has already read it as null (VaCuusInteractiveSnapshot.cpp:432 gates the
+	// projected path on it). So on the reveal frame the snapshot hit-tests the element's untransformed
+	// rect and converges one frame later -- the same one-frame lag every transform property change has
+	// (OnPropertyChange dirties, Element.cpp:1962-1963; Render computes). Before the patch the element
+	// stayed untransformed forever, on both channels.
 	PublishInteractiveSnapshot();
 
 	// The hash the idle gate compares is computed inside EndFrameAndPublish(), so its

@@ -18,7 +18,7 @@ stay there if you vendor the plugin into your own tree.
 | ↳ RmlUi Debugger font assets (*Courier Prime Code*, regular and italic) | SIL Open Font License 1.1 | `Source/ThirdParty/RmlUi/Source/Debugger/LICENSE.txt` |
 | **quickjs-ng** — the JavaScript engine | MIT © 2017–2026 Fabrice Bellard; © 2017–2024 Charlie Gordon; © 2023–2026 Ben Noordhuis; © 2023–2026 Saúl Ibarra Corretgé | `Source/ThirdParty/quickjs-ng/LICENSE` |
 
-**RmlUi is modified.** Four local patches are applied on top of the vendored commit; each
+**RmlUi is modified.** Local patches are applied on top of the vendored commit; each
 is described, with its reason and its named regression test, in
 `Source/ThirdParty/RmlUi/VENDORED_TAG.txt`. MIT permits the modification and requires only
 that the notice above travel with it, which it does. If you re-vendor, read that file
