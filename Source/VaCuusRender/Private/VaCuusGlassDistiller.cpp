@@ -19,7 +19,44 @@ struct FMaskDraw
 	EVaCuusClipMaskOp Op = EVaCuusClipMaskOp::Set;
 	FVaCuusGeometryHandle Geometry = 0;
 	FVector2f Translation = FVector2f::ZeroVector;
+
+	/** The parse state's CurrentTransform at this draw — see the Set case in Distill(). */
+	FMatrix44f Transform = FMatrix44f::Identity;
 };
+
+/**
+ * A transformed copy of Geometry: every vertex position becomes (position + Translation)
+ * pushed through Transform, THE SAME COMPOSITION the replayer's stencil pass draws with
+ * (VaCuusReplayRenderer.cpp:1520-1525 — Translate * CurrentTransform, then the GPU's own
+ * clip.xy / clip.w once Projection is applied). Projection itself is deliberately not
+ * mirrored here: it is the universal view-space-to-clip mapping every entry goes through
+ * later via VaCuusGlassMapping, not part of the CLIP ELEMENT's own transform, and baking
+ * it in would leave the vertices in the wrong space for that later mapping. Indices are
+ * shared verbatim — the triangle list does not change, only where its vertices land.
+ */
+TSharedPtr<FVaCuusGeometryData> TransformMaskGeometry(const FVaCuusGeometryData& Geometry, const FVector2f& Translation, const FMatrix44f& Transform)
+{
+	TSharedPtr<FVaCuusGeometryData> Transformed = MakeShared<FVaCuusGeometryData>();
+	Transformed->Indices = Geometry.Indices;
+	Transformed->Vertices.Reserve(Geometry.Vertices.Num());
+
+	for (const FVaCuusVertex& Vertex : Geometry.Vertices)
+	{
+		const FVector4f Local(Vertex.Position.X + Translation.X, Vertex.Position.Y + Translation.Y, 0.0f, 1.0f);
+		const FVector4f Homogeneous = Transform.TransformFVector4(Local);
+
+		// The perspective divide: a plain 2D transform (scale/rotate/skew/translate)
+		// always leaves W at 1, so this is a no-op for the common case and only bites
+		// for a genuine CSS 3D `perspective()` on the clip element's transform chain.
+		const float InvW = (Homogeneous.W != 0.0f) ? (1.0f / Homogeneous.W) : 1.0f;
+
+		FVaCuusVertex NewVertex = Vertex;
+		NewVertex.Position = FVector2f(Homogeneous.X * InvW, Homogeneous.Y * InvW);
+		Transformed->Vertices.Add(NewVertex);
+	}
+
+	return Transformed;
+}
 } // namespace VaCuusGlassPrivate
 
 void FVaCuusGlassDistiller::Distill(const FVaCuusCommandBuffer& Buffer)
@@ -42,9 +79,12 @@ void FVaCuusGlassDistiller::Distill(const FVaCuusCommandBuffer& Buffer)
 		FilterSigmas.Add(Pair.Key, Pair.Value.Sigma);
 	}
 
-	// The parse state: scissor, clip-mask list and layer stack, tracked exactly as the
-	// replayer would apply them.
+	// The parse state: scissor, transform, clip-mask list and layer stack, tracked
+	// exactly as the replayer would apply them. CurrentTransform starts at identity —
+	// the same value the replayer assumes at the top of its own command walk
+	// (VaCuusReplayRenderer.cpp:1106) before any SetTransform has been seen.
 	TOptional<FIntRect> Scissor;
+	FMatrix44f CurrentTransform = FMatrix44f::Identity;
 	TArray<FMaskDraw, TInlineAllocator<4>> ActiveMasks;
 	TArray<FVaCuusLayerHandle, TInlineAllocator<4>> LayerStack;
 	TMap<FVaCuusLayerHandle, FPendingGrab> PendingGrabs;
@@ -64,6 +104,10 @@ void FVaCuusGlassDistiller::Distill(const FVaCuusCommandBuffer& Buffer)
 				Scissor.Reset();
 				break;
 
+			case EVaCuusCommandType::SetTransform:
+				CurrentTransform = Command.Transform;
+				break;
+
 			case EVaCuusCommandType::EnableClipMask:
 				// BOTH edges clear the list: the enable edge is RmlUi's "a new mask list
 				// replaces the old one" signal (RenderManager::ApplyClipMask,
@@ -73,7 +117,7 @@ void FVaCuusGlassDistiller::Distill(const FVaCuusCommandBuffer& Buffer)
 
 			case EVaCuusCommandType::RenderToClipMask:
 			{
-				ActiveMasks.Add({Command.ClipMaskOp, Command.Geometry, Command.Translation});
+				ActiveMasks.Add({Command.ClipMaskOp, Command.Geometry, Command.Translation, CurrentTransform});
 
 				// Feed the cross-buffer map at the reference, from the SAME buffer's
 				// NewGeometry — see the map's declaration for why first-reference and
@@ -156,8 +200,25 @@ void FVaCuusGlassDistiller::Distill(const FVaCuusCommandBuffer& Buffer)
 						{
 							if (const TSharedPtr<const FVaCuusGeometryData>* Found = MaskGeometry.Find(ActiveMasks[0].Geometry))
 							{
-								Entry.MaskGeometry = *Found;
-								Entry.MaskTranslation = ActiveMasks[0].Translation;
+								if (ActiveMasks[0].Transform == FMatrix44f::Identity)
+								{
+									// The common case, unchanged: shared ref, no copy.
+									Entry.MaskGeometry = *Found;
+									Entry.MaskTranslation = ActiveMasks[0].Translation;
+								}
+								else
+								{
+									// The clip element is transformed (e.g. a HUD panel
+									// scaled by transform: scale() around a screen
+									// corner). The recorded geometry and Translation are
+									// still in the clip element's OWN untransformed
+									// space, so bake the transform in now — an owned
+									// copy the cross-buffer map never sees, because the
+									// map keeps the untransformed geometry other buffers
+									// (or a differently transformed one) still need.
+									Entry.MaskGeometry = TransformMaskGeometry(**Found, ActiveMasks[0].Translation, ActiveMasks[0].Transform);
+									Entry.MaskTranslation = FVector2f::ZeroVector;
+								}
 							}
 							else if (!bWarnedUnresolvedMask)
 							{

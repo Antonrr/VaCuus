@@ -42,19 +42,36 @@ struct FVaCuusGlassEntry
 	float Sigma = 0.0f;
 
 	/**
-	 * The rounded mask: a COPY of the clip-mask geometry (the recorded
-	 * RenderToClipMask(Set) between the two composites), shared with the distiller's
-	 * cross-buffer map. Null = square corners (scissor-only clipping) — the element draws
-	 * a plain quad over DrawRegion instead.
+	 * The rounded mask: the clip-mask geometry's vertices in VIEW SPACE, with the clip
+	 * element's own transform (RenderManager::ApplyClipMask's SetTransform, if any)
+	 * ALREADY APPLIED — see the Set case in Distill(). Two shapes, chosen there:
+	 *   - the clip element carries no transform: a COPY of the compiled geometry
+	 *     (recorded RenderToClipMask(Set) between the two composites), shared with the
+	 *     distiller's cross-buffer map, plus MaskTranslation, exactly as recorded;
+	 *   - the clip element is transformed: an OWNED copy whose vertices already have
+	 *     translation and transform baked in (MaskTranslation is then zero), because
+	 *     the transform is the CLIP ELEMENT's, not the glass panel's — a scale on some
+	 *     ancestor moves the mask by more than its own border-box offset, and baking it
+	 *     in here is what lets the element keep mapping every entry through DestRect the
+	 *     same way regardless of whether a transform was involved upstream.
+	 * Null = square corners (scissor-only clipping) — the element draws a plain quad
+	 * over DrawRegion instead.
 	 *
-	 * THE LIST OWNS ITS COPY (via this shared ref): the buffer the vertices arrived in is
-	 * recycled after replay, and the map entry may be retired by a later buffer's
-	 * ReleasedGeometry while this list still draws — the ref keeps the payload alive until
-	 * the next wholesale replacement drops it.
+	 * THE LIST OWNS ITS COPY either way: in the untransformed shape via the shared ref
+	 * (the buffer the vertices arrived in is recycled after replay, and the map entry
+	 * may be retired by a later buffer's ReleasedGeometry while this list still draws —
+	 * the ref keeps the payload alive until the next wholesale replacement drops it); in
+	 * the transformed shape because the entry's copy is its own fresh allocation, built
+	 * every Distill() and never fed back into the cross-buffer map (which keeps the
+	 * original, untransformed geometry for whichever buffer references the handle next).
 	 */
 	TSharedPtr<const FVaCuusGeometryData> MaskGeometry;
 
-	/** RenderToClipMask's Translation: the mask's border-box offset in view space. */
+	/**
+	 * RenderToClipMask's Translation: the mask's border-box offset in view space. Zero
+	 * once a transform has already been baked into MaskGeometry's vertices (see above) —
+	 * applying it again would translate the mask twice.
+	 */
 	FVector2f MaskTranslation = FVector2f::ZeroVector;
 };
 

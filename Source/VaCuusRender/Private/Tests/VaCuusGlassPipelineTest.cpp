@@ -50,6 +50,29 @@ bool RecordAndDistill(FVaCuusRecordingRenderInterface& Recorder, Rml::Context* C
 	}
 	return false;
 }
+
+/** The axis-aligned bounding box of every vertex position + Translation, rounded to pixels. */
+FIntRect ComputeVertexBoundingBox(const FVaCuusGeometryData& Geometry, const FVector2f& Translation)
+{
+	FVector2f Min(TNumericLimits<float>::Max(), TNumericLimits<float>::Max());
+	FVector2f Max(TNumericLimits<float>::Lowest(), TNumericLimits<float>::Lowest());
+	for (const FVaCuusVertex& Vertex : Geometry.Vertices)
+	{
+		const FVector2f Position = Vertex.Position + Translation;
+		Min.X = FMath::Min(Min.X, Position.X);
+		Min.Y = FMath::Min(Min.Y, Position.Y);
+		Max.X = FMath::Max(Max.X, Position.X);
+		Max.Y = FMath::Max(Max.Y, Position.Y);
+	}
+	return FIntRect(FMath::RoundToInt(Min.X), FMath::RoundToInt(Min.Y), FMath::RoundToInt(Max.X), FMath::RoundToInt(Max.Y));
+}
+
+/** Every edge of Actual within one pixel of the same edge of Expected. */
+bool BoxWithinOnePixel(const FIntRect& Actual, const FIntRect& Expected)
+{
+	return FMath::Abs(Actual.Min.X - Expected.Min.X) <= 1 && FMath::Abs(Actual.Min.Y - Expected.Min.Y) <= 1 &&
+		FMath::Abs(Actual.Max.X - Expected.Max.X) <= 1 && FMath::Abs(Actual.Max.Y - Expected.Max.Y) <= 1;
+}
 } // namespace VaCuusGlassPipelineTest
 
 /**
@@ -132,6 +155,120 @@ bool FVaCuusGlassDistillSequenceTest::RunTest(const FString& Parameters)
 		TestTrue(TEXT("...a non-empty owned copy"),
 			Entry.MaskGeometry->Vertices.Num() > 0 && Entry.MaskGeometry->Indices.Num() > 0);
 		TestTrue(TEXT("...at the border-box translation (40,40)"), Entry.MaskTranslation == FVector2f(40.0f, 40.0f));
+	}
+
+	return true;
+}
+
+/**
+ * A glass panel under a transformed ancestor — the usual game-HUD shape of a panel root
+ * scaled by transform: scale() around a screen corner. Before the fix the mask carried
+ * only the panel's UNSCALED border box, because Distill() never tracked SetTransform, so
+ * the mask covered only the part of the scaled panel nearest the transform origin. After
+ * the fix the mask vertices land at the scaled box, same as SampleRegion/DrawRegion
+ * always did.
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVaCuusGlassDistillTransformedMaskTest, "VaCuus.Render.Glass.DistillTransformedMask",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FVaCuusGlassDistillTransformedMaskTest::RunTest(const FString& Parameters)
+{
+	using namespace VaCuusGlassPipelineTest;
+
+	if (!TestFalse(TEXT("RmlUi is down before the test"), FVaCuusEngine::Get().IsInitialized()))
+	{
+		return false;
+	}
+
+	FVaCuusEngine& Engine = FVaCuusEngine::Get();
+	if (!TestTrue(TEXT("Initialized"), Engine.Initialize()))
+	{
+		return false;
+	}
+	ON_SCOPE_EXIT
+	{
+		Engine.Shutdown();
+	};
+
+	FVaCuusRecordingRenderInterface Recorder;
+	const Rml::String ContextName("vacuus_glass_transform_test");
+	Rml::Context* Context = Rml::CreateContext(ContextName, Rml::Vector2i(GViewSize.X, GViewSize.Y), &Recorder);
+	if (!TestNotNull(TEXT("Context"), Context))
+	{
+		return false;
+	}
+	ON_SCOPE_EXIT
+	{
+		Rml::RemoveContext(ContextName);
+	};
+
+	// #panel is the Task 2 reference panel again: border box (40,40)-(240,160),
+	// border-radius:12px, blur(12px). #parent sits at the document origin and scales it
+	// 1.5x around its own top-left corner (the HUD's own transform-origin choice), so the
+	// scale's centre IS the document origin and every corner just multiplies by 1.5:
+	//   scaled box = (40*1.5, 40*1.5) .. ((40+200)*1.5, (40+120)*1.5) = (60,60)-(360,240)
+	static const TCHAR* Source =
+		TEXT("<rml><head><style>")
+		TEXT("body{display:block;width:100%;height:100%;}")
+		TEXT("#parent{display:block;position:absolute;left:0px;top:0px;width:400px;height:300px;}")
+		TEXT("#parent.scaled{transform:scale(1.5);transform-origin:left top;}")
+		TEXT("#panel{display:block;position:absolute;left:40px;top:40px;width:200px;height:120px;")
+		TEXT("border-radius:12px;background-color:#30405080;backdrop-filter:blur(12px);}")
+		TEXT("</style></head><body><div id=\"parent\" class=\"scaled\"><div id=\"panel\"/></div></body></rml>");
+
+	Rml::ElementDocument* Document =
+		Context->LoadDocumentFromMemory(Rml::String(TCHAR_TO_UTF8(Source)), "vacuus://glass_transform.rml");
+	if (!TestNotNull(TEXT("Document"), Document))
+	{
+		return false;
+	}
+	Document->Show();
+
+	Rml::Element* Parent = Document->GetElementById("parent");
+	if (!TestNotNull(TEXT("Parent element"), Parent))
+	{
+		return false;
+	}
+
+	// Settle, same as the removal test: a fresh rounded panel publishes more than once
+	// (the clip-geometry settle), and every published buffer is distilled as the element
+	// would distill it.
+	FVaCuusGlassDistiller Distiller;
+	for (int32 Settle = 0; Settle < 4 && RecordAndDistill(Recorder, Context, Distiller); ++Settle)
+	{
+	}
+
+	if (TestEqual(TEXT("Exactly one glass entry under the transformed ancestor"), Distiller.GetEntries().Num(), 1))
+	{
+		const FVaCuusGlassEntry& Entry = Distiller.GetEntries()[0];
+		if (TestTrue(TEXT("The transformed panel still carries its clip-mask geometry"), Entry.MaskGeometry.IsValid()))
+		{
+			const FIntRect ExpectedBox(60, 60, 360, 240);
+			const FIntRect ActualBox = ComputeVertexBoundingBox(*Entry.MaskGeometry, Entry.MaskTranslation);
+			TestTrue(FString::Printf(TEXT("Mask vertices land at the SCALED border box %s (got %s)"), *ExpectedBox.ToString(), *ActualBox.ToString()),
+				BoxWithinOnePixel(ActualBox, ExpectedBox));
+			TestTrue(TEXT("DrawRegion contains the scaled mask box"), Entry.DrawRegion.Contains(ActualBox));
+		}
+	}
+
+	// THE REGRESSION GUARD: the same panel with #parent's transform removed must still
+	// give the UNSCALED box — the identity path (shared ref + MaskTranslation, today's
+	// behaviour) stays untouched by this fix.
+	Parent->SetClass("scaled", false);
+	for (int32 Settle = 0; Settle < 4 && RecordAndDistill(Recorder, Context, Distiller); ++Settle)
+	{
+	}
+
+	if (TestEqual(TEXT("Exactly one glass entry once the ancestor transform is gone"), Distiller.GetEntries().Num(), 1))
+	{
+		const FVaCuusGlassEntry& Entry = Distiller.GetEntries()[0];
+		if (TestTrue(TEXT("The untransformed panel still carries its clip-mask geometry"), Entry.MaskGeometry.IsValid()))
+		{
+			const FIntRect ExpectedBox(40, 40, 240, 160);
+			const FIntRect ActualBox = ComputeVertexBoundingBox(*Entry.MaskGeometry, Entry.MaskTranslation);
+			TestTrue(FString::Printf(TEXT("Mask vertices land at the UNSCALED border box %s (got %s)"), *ExpectedBox.ToString(), *ActualBox.ToString()),
+				BoxWithinOnePixel(ActualBox, ExpectedBox));
+		}
 	}
 
 	return true;
