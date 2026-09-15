@@ -332,10 +332,28 @@ void FVaCuusSlateElement::RefreshGlassDrawResources(FRHICommandList& RHICmdList)
 		return;
 	}
 	GlassDrawsGeneration = GlassDistiller.GetListGeneration();
+
+	// The list is replaced wholesale by every published buffer, but the GEOMETRY behind it
+	// usually is not — the same compiled clip shape comes back publish after publish, and a
+	// transform lives in the draw matrix rather than in the vertices. So carry the buffers
+	// across instead of recreating them: a publish provoked by anything else in the document
+	// then costs a glass panel nothing.
+	TArray<FGlassDraw> Previous = MoveTemp(GlassDraws);
 	GlassDraws.Reset();
 
 	for (const FVaCuusGlassEntry& Entry : GlassDistiller.GetEntries())
 	{
+		// A linear scan, deliberately: a document has a handful of glass panels, and a map
+		// keyed on a shared ref would cost more to maintain than it could save.
+		const int32 Reusable = Previous.IndexOfByPredicate([&Entry](const FGlassDraw& Candidate)
+			{ return Candidate.VB.IsValid() && VaCuusGlassDrawMatchesEntry(Candidate.SourceGeometry, Candidate.SourceQuad, Entry); });
+		if (Reusable != INDEX_NONE)
+		{
+			GlassDraws.Add(MoveTemp(Previous[Reusable]));
+			Previous.RemoveAt(Reusable);
+			continue;
+		}
+
 		FGlassDraw& Draw = GlassDraws.AddDefaulted_GetRef();
 
 		// The square case generates a DrawRegion quad through the SAME vertex layout and
@@ -373,6 +391,11 @@ void FVaCuusSlateElement::RefreshGlassDrawResources(FRHICommandList& RHICmdList)
 			RHICmdList, TEXT("VaCuusGlassIB"), EBufferUsageFlags::Static, IndexView);
 		Draw.NumVertices = VertexView.Num();
 		Draw.NumIndices = IndexView.Num();
+
+		// The key this upload can be skipped by next time. Empty rect for a rounded entry:
+		// its geometry is the identity, and its DrawRegion is free to move without a rebuild.
+		Draw.SourceGeometry = Entry.MaskGeometry;
+		Draw.SourceQuad = Entry.MaskGeometry.IsValid() ? FIntRect() : Entry.DrawRegion;
 	}
 }
 
@@ -497,7 +520,6 @@ void FVaCuusSlateElement::AddGlassPasses(FRDGBuilder& GraphBuilder, const FVaCuu
 	TShaderMapRef<FVaCuusCompositePS> DownsamplePS(ShaderMap, FVaCuusCompositePS::FPermutationDomain());
 	TShaderMapRef<FVaCuusUIVS> GlassVertexShader(ShaderMap);
 	TShaderMapRef<FVaCuusGlassPS> GlassPixelShader(ShaderMap);
-	const FMatrix44f PixelToClip = VaCuusReplay::MakePixelToClipMatrix(OutputExtent);
 
 	for (const FMappedEntry& Mapped : MappedEntries)
 	{
@@ -539,16 +561,12 @@ void FVaCuusSlateElement::AddGlassPasses(FRDGBuilder& GraphBuilder, const FVaCuu
 		// mask's coverage lerps blurred-over-sharp; dest alpha untouched (CW_RGB) — the
 		// output's alpha channel is never meaningful (2 bits on the desktop default).
 		{
-			// Row-vector composition: mask translation (view px) -> mapping scale+offset
-			// (output px) -> clip. Collapsed into one affine before the ortho.
-			FMatrix44f Affine = FMatrix44f::Identity;
-			Affine.M[0][0] = Mapping.Scale.X;
-			Affine.M[1][1] = Mapping.Scale.Y;
-			Affine.M[3][0] = Entry.MaskTranslation.X * Mapping.Scale.X + Mapping.Offset.X;
-			Affine.M[3][1] = Entry.MaskTranslation.Y * Mapping.Scale.Y + Mapping.Offset.Y;
-
+			// Row-vector composition: mask translation (view px) -> the CLIP ELEMENT's own
+			// transform -> mapping scale+offset (output px) -> clip. One shared function
+			// rather than four assignments here, so the matrix the shader gets and the one
+			// VaCuus.Render.Glass.MaskMatrix asserts cannot drift apart.
 			FVaCuusUIShaderParameters VSParameters;
-			VSParameters.Projection = Affine * PixelToClip;
+			VSParameters.Projection = VaCuusMakeGlassMaskMatrix(Entry, Mapping, OutputExtent);
 			VSParameters.UITexture = GWhiteTexture->TextureRHI;
 			VSParameters.UISampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 			VSParameters.bUseTexture = 0;

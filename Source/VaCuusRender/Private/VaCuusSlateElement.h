@@ -122,6 +122,17 @@ private:
 		FBufferRHIRef IB;
 		int32 NumVertices = 0;
 		int32 NumIndices = 0;
+
+		/**
+		 * What these buffers were built FROM, so an entry that did not change keeps them
+		 * instead of re-uploading. THE SHARED REF, not a raw pointer: holding it is what
+		 * makes address equality mean identity, since the payload cannot be freed and its
+		 * address handed out again while this reference is alive. SourceQuad carries the
+		 * square-corner case, whose quad is generated from DrawRegion. Matched by
+		 * VaCuusGlassDrawMatchesEntry, which is where the rule lives and is tested.
+		 */
+		TSharedPtr<const FVaCuusGeometryData> SourceGeometry;
+		FIntRect SourceQuad = FIntRect();
 	};
 
 	/** Parallel to GlassDistiller.GetEntries(); rebuilt when the list generation moves. */

@@ -42,37 +42,53 @@ struct FVaCuusGlassEntry
 	float Sigma = 0.0f;
 
 	/**
-	 * The rounded mask: the clip-mask geometry's vertices in VIEW SPACE, with the clip
-	 * element's own transform (RenderManager::ApplyClipMask's SetTransform, if any)
-	 * ALREADY APPLIED — see the Set case in Distill(). Two shapes, chosen there:
-	 *   - the clip element carries no transform: a COPY of the compiled geometry
-	 *     (recorded RenderToClipMask(Set) between the two composites), shared with the
-	 *     distiller's cross-buffer map, plus MaskTranslation, exactly as recorded;
-	 *   - the clip element is transformed: an OWNED copy whose vertices already have
-	 *     translation and transform baked in (MaskTranslation is then zero), because
-	 *     the transform is the CLIP ELEMENT's, not the glass panel's — a scale on some
-	 *     ancestor moves the mask by more than its own border-box offset, and baking it
-	 *     in here is what lets the element keep mapping every entry through DestRect the
-	 *     same way regardless of whether a transform was involved upstream.
-	 * Null = square corners (scissor-only clipping) — the element draws a plain quad
-	 * over DrawRegion instead.
+	 * The rounded mask: a COPY of the clip-mask geometry (the recorded
+	 * RenderToClipMask(Set) between the two composites), shared with the distiller's
+	 * cross-buffer map, in the clip element's OWN untransformed space. Null = square
+	 * corners (scissor-only clipping) -- the element draws a plain quad over DrawRegion
+	 * instead.
 	 *
-	 * THE LIST OWNS ITS COPY either way: in the untransformed shape via the shared ref
-	 * (the buffer the vertices arrived in is recycled after replay, and the map entry
-	 * may be retired by a later buffer's ReleasedGeometry while this list still draws —
-	 * the ref keeps the payload alive until the next wholesale replacement drops it); in
-	 * the transformed shape because the entry's copy is its own fresh allocation, built
-	 * every Distill() and never fed back into the cross-buffer map (which keeps the
-	 * original, untransformed geometry for whichever buffer references the handle next).
+	 * THE LIST OWNS ITS COPY (via this shared ref): the buffer the vertices arrived in is
+	 * recycled after replay, and the map entry may be retired by a later buffer's
+	 * ReleasedGeometry while this list still draws -- the ref keeps the payload alive until
+	 * the next wholesale replacement drops it. Staying a SHARED ref rather than a per-entry
+	 * copy is also what lets the element's draw-buffer cache key on it (VaCuusSlateElement.h,
+	 * FGlassDraw::SourceGeometry).
 	 */
 	TSharedPtr<const FVaCuusGeometryData> MaskGeometry;
 
-	/**
-	 * RenderToClipMask's Translation: the mask's border-box offset in view space. Zero
-	 * once a transform has already been baked into MaskGeometry's vertices (see above) —
-	 * applying it again would translate the mask twice.
-	 */
+	/** RenderToClipMask's Translation: the mask's border-box offset in view space. */
 	FVector2f MaskTranslation = FVector2f::ZeroVector;
+
+	/**
+	 * The clip element's OWN transform at the mask draw. RenderManager::ApplyClipMask calls
+	 * SetTransform with each clip element's transform before its RenderToClipMask and
+	 * restores the caller's afterwards (ThirdParty/RmlUi/Source/Core/RenderManager.cpp:164-175),
+	 * and a child of a transformed ancestor carries the accumulated matrix
+	 * (ThirdParty/RmlUi/Source/Core/Element.cpp:3003-3018) -- so this is how a HUD panel
+	 * scaled by a `transform: scale()` on its root reaches the glass draw at all. Identity
+	 * for the overwhelmingly common untransformed panel.
+	 *
+	 * NOT applied to the vertices. It is folded into the draw matrix by
+	 * VaCuusMakeGlassMaskMatrix, which keeps MaskGeometry a shared ref and leaves the
+	 * perspective divide to the GPU, where it is exact.
+	 */
+	FMatrix44f MaskTransform = FMatrix44f::Identity;
+
+	/**
+	 * Intersect clip masks applied as BOUNDS ONLY: their transformed axis-aligned box was
+	 * intersected into DrawRegion, their shape was not drawn. Zero for the ordinary panel.
+	 *
+	 * WHY THIS NUMBER EXISTS. Without a transform an ancestor's clip reaches the entry
+	 * through the scissor, so DrawRegion already carries it. With one it does not:
+	 * GetClippingRegion sets disable_scissor_clipping for a transformed clipping element and
+	 * expresses that ancestor ONLY as an Intersect mask
+	 * (ThirdParty/RmlUi/Source/Core/ElementUtilities.cpp:162-178). Folding the bounds
+	 * restores parity, so a transform does not change what is supported. What parity does
+	 * NOT restore is an ancestor's corner ROUNDING, and this counter is how that remaining
+	 * gap is asserted rather than merely believed.
+	 */
+	int32 BoundsOnlyMasks = 0;
 };
 
 /**
@@ -184,3 +200,38 @@ struct FVaCuusGlassMapping
 
 FVaCuusGlassMapping VaCuusMakeGlassMapping(
 	const FIntRect& DestRect, const FVector2f& ElementsOffset, FIntPoint ViewSize, const FIntRect& SceneViewRect, FIntPoint OutputExtent);
+
+/**
+ * The mask's draw matrix: mask vertices -> clip space, in ROW-VECTOR order
+ *
+ *   translate(MaskTranslation) * MaskTransform * (mapping scale, offset) * pixel-to-clip
+ *
+ * the same composition the replayer's stencil pass draws the very same mask with
+ * (VaCuusReplayRenderer.cpp:1525), with the perspective divide left to the GPU.
+ *
+ * WHY THE DIVIDE CAN BE LEFT THERE, which is what makes this exact rather than an
+ * approximation for a projective MaskTransform: everything after MaskTransform is affine
+ * with fourth column (0,0,0,1), so w survives untouched to the GPU's divide and the divide
+ * commutes with those matrices. And the z a 3D transform produces never reaches the output
+ * -- MakePixelToClipMatrix pins clip z at 0.5*w and gives z no path into x or y
+ * (VaCuusReplayRenderer.cpp:214-224) -- so a rotated-in-3D panel cannot drift outside the
+ * clip planes.
+ *
+ * Pure data in, data out: VaCuus.Render.Glass.MaskMatrix drives it with no engine at all,
+ * and the Slate element uses this same function, so the shader and the test cannot drift.
+ */
+FMatrix44f VaCuusMakeGlassMaskMatrix(const FVaCuusGlassEntry& Entry, const FVaCuusGlassMapping& Mapping, FIntPoint OutputExtent);
+
+/**
+ * Can vertex/index buffers built from (SourceGeometry, SourceQuad) be KEPT for Entry?
+ *
+ * The element rebuilds its per-entry draw buffers whenever the glass list is replaced, and
+ * the list is replaced by every published buffer -- so without this, a clock ticking in the
+ * corner of the HUD recreates an untouched glass panel's buffers, on every publish, forever.
+ *
+ * THE TRANSFORM IS DELIBERATELY NOT PART OF THE KEY. It never touches the vertices: it is
+ * folded into the draw matrix per engine frame by VaCuusMakeGlassMaskMatrix. So a panel
+ * being animated by `transform` re-uploads nothing at all, which is the whole reason the
+ * matrix is carried instead of baked.
+ */
+bool VaCuusGlassDrawMatchesEntry(const TSharedPtr<const FVaCuusGeometryData>& SourceGeometry, const FIntRect& SourceQuad, const FVaCuusGlassEntry& Entry);

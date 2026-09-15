@@ -3,6 +3,7 @@
 #include "VaCuusGlassDistiller.h"
 
 #include "VaCuusDefines.h"
+#include "VaCuusReplayRenderer.h"
 
 namespace VaCuusGlassPrivate
 {
@@ -24,38 +25,39 @@ struct FMaskDraw
 	FMatrix44f Transform = FMatrix44f::Identity;
 };
 
+
 /**
- * A transformed copy of Geometry: every vertex position becomes (position + Translation)
- * pushed through Transform, THE SAME COMPOSITION the replayer's stencil pass draws with
- * (VaCuusReplayRenderer.cpp:1520-1525 — Translate * CurrentTransform, then the GPU's own
- * clip.xy / clip.w once Projection is applied). Projection itself is deliberately not
- * mirrored here: it is the universal view-space-to-clip mapping every entry goes through
- * later via VaCuusGlassMapping, not part of the CLIP ELEMENT's own transform, and baking
- * it in would leave the vertices in the wrong space for that later mapping. Indices are
- * shared verbatim — the triangle list does not change, only where its vertices land.
+ * The transformed axis-aligned bounds of a mask, in view pixels. False for empty geometry.
+ *
+ * The perspective divide happens HERE, on the CPU, unlike the Set mask's — a rectangle has
+ * no w to carry, so there is nowhere downstream to defer it to. Harmless: an affine
+ * transform leaves w at 1 and this is a no-op for it.
  */
-TSharedPtr<FVaCuusGeometryData> TransformMaskGeometry(const FVaCuusGeometryData& Geometry, const FVector2f& Translation, const FMatrix44f& Transform)
+bool ComputeMaskBounds(const FVaCuusGeometryData& Geometry, const FVector2f& Translation, const FMatrix44f& Transform, FIntRect& OutBounds)
 {
-	TSharedPtr<FVaCuusGeometryData> Transformed = MakeShared<FVaCuusGeometryData>();
-	Transformed->Indices = Geometry.Indices;
-	Transformed->Vertices.Reserve(Geometry.Vertices.Num());
-
-	for (const FVaCuusVertex& Vertex : Geometry.Vertices)
+	if (Geometry.Vertices.Num() == 0)
 	{
-		const FVector4f Local(Vertex.Position.X + Translation.X, Vertex.Position.Y + Translation.Y, 0.0f, 1.0f);
-		const FVector4f Homogeneous = Transform.TransformFVector4(Local);
-
-		// The perspective divide: a plain 2D transform (scale/rotate/skew/translate)
-		// always leaves W at 1, so this is a no-op for the common case and only bites
-		// for a genuine CSS 3D `perspective()` on the clip element's transform chain.
-		const float InvW = (Homogeneous.W != 0.0f) ? (1.0f / Homogeneous.W) : 1.0f;
-
-		FVaCuusVertex NewVertex = Vertex;
-		NewVertex.Position = FVector2f(Homogeneous.X * InvW, Homogeneous.Y * InvW);
-		Transformed->Vertices.Add(NewVertex);
+		return false;
 	}
 
-	return Transformed;
+	FVector2f Min(TNumericLimits<float>::Max(), TNumericLimits<float>::Max());
+	FVector2f Max(TNumericLimits<float>::Lowest(), TNumericLimits<float>::Lowest());
+	for (const FVaCuusVertex& Vertex : Geometry.Vertices)
+	{
+		const FVector4f Homogeneous = Transform.TransformFVector4(
+			FVector4f(Vertex.Position.X + Translation.X, Vertex.Position.Y + Translation.Y, 0.0f, 1.0f));
+		const float InvW = (Homogeneous.W != 0.0f) ? (1.0f / Homogeneous.W) : 1.0f;
+		const FVector2f Position(Homogeneous.X * InvW, Homogeneous.Y * InvW);
+		Min.X = FMath::Min(Min.X, Position.X);
+		Min.Y = FMath::Min(Min.Y, Position.Y);
+		Max.X = FMath::Max(Max.X, Position.X);
+		Max.Y = FMath::Max(Max.Y, Position.Y);
+	}
+
+	// Rounded OUTWARD: this rect clips DrawRegion, so it must never eat a pixel the mask
+	// actually covers. Erring inward would trim the panel's own edge.
+	OutBounds = FIntRect(FMath::FloorToInt(Min.X), FMath::FloorToInt(Min.Y), FMath::CeilToInt(Max.X), FMath::CeilToInt(Max.Y));
+	return true;
 }
 } // namespace VaCuusGlassPrivate
 
@@ -191,34 +193,29 @@ void FVaCuusGlassDistiller::Distill(const FVaCuusCommandBuffer& Buffer)
 						Entry.Sigma = Grab.Sigma;
 
 						// The rounded mask: the Set draw of the active list (first —
-						// ElementUtilities.cpp:165-169 makes the first Set and ancestors
+						// ElementUtilities.cpp:163-169 makes the first Set and ancestors
 						// Intersect). v1 draws the Set mask only; ancestor ROUNDED clipping
 						// over a glass panel is out of scope (spec §11 — root-level
-						// elements), while ancestor square clipping still lands via
-						// DrawRegion's scissor.
+						// elements). Ancestor SQUARE clipping lands in DrawRegion either
+						// way: through the scissor when that ancestor is untransformed, and
+						// through the Intersect fold below when it is not — a transformed
+						// clipping element puts NOTHING in the scissor
+						// (ElementUtilities.cpp:174-178).
 						if (ActiveMasks.Num() > 0 && ActiveMasks[0].Op == EVaCuusClipMaskOp::Set)
 						{
 							if (const TSharedPtr<const FVaCuusGeometryData>* Found = MaskGeometry.Find(ActiveMasks[0].Geometry))
 							{
-								if (ActiveMasks[0].Transform == FMatrix44f::Identity)
-								{
-									// The common case, unchanged: shared ref, no copy.
-									Entry.MaskGeometry = *Found;
-									Entry.MaskTranslation = ActiveMasks[0].Translation;
-								}
-								else
-								{
-									// The clip element is transformed (e.g. a HUD panel
-									// scaled by transform: scale() around a screen
-									// corner). The recorded geometry and Translation are
-									// still in the clip element's OWN untransformed
-									// space, so bake the transform in now — an owned
-									// copy the cross-buffer map never sees, because the
-									// map keeps the untransformed geometry other buffers
-									// (or a differently transformed one) still need.
-									Entry.MaskGeometry = TransformMaskGeometry(**Found, ActiveMasks[0].Translation, ActiveMasks[0].Transform);
-									Entry.MaskTranslation = FVector2f::ZeroVector;
-								}
+								Entry.MaskGeometry = *Found;
+								Entry.MaskTranslation = ActiveMasks[0].Translation;
+
+								// The clip element's own transform rides along as a MATRIX
+								// rather than being pushed into the vertices. Two things
+								// depend on that choice: the geometry stays the map's
+								// shared untransformed copy, which is the key the
+								// element's draw-buffer cache needs, and the perspective
+								// divide stays on the GPU, where it is exact rather than
+								// approximated in view space.
+								Entry.MaskTransform = ActiveMasks[0].Transform;
 							}
 							else if (!bWarnedUnresolvedMask)
 							{
@@ -228,6 +225,24 @@ void FVaCuusGlassDistiller::Distill(const FVaCuusCommandBuffer& Buffer)
 								UE_LOG(LogVaCuus, Warning,
 									TEXT("Glass distiller: clip-mask geometry %llu is not resolvable; drawing the panel square"),
 									ActiveMasks[0].Geometry);
+							}
+						}
+
+						// Every mask after the first is an Intersect (see above). Its exact
+						// SHAPE is not drawn — one Set mask stays the drawn geometry — but
+						// its BOUNDS belong in DrawRegion, which the glass draw is scissored
+						// to. Strictly conservative and so it cannot erase a pixel RmlUi
+						// would have painted: the clip is the INTERSECTION of the mask
+						// shapes, so every drawn pixel lies inside every mask's bounds.
+						for (int32 MaskIndex = 1; MaskIndex < ActiveMasks.Num(); ++MaskIndex)
+						{
+							const FMaskDraw& Mask = ActiveMasks[MaskIndex];
+							const TSharedPtr<const FVaCuusGeometryData>* Found = MaskGeometry.Find(Mask.Geometry);
+							FIntRect Bounds;
+							if (Found && VaCuusGlassPrivate::ComputeMaskBounds(**Found, Mask.Translation, Mask.Transform, Bounds))
+							{
+								Entry.DrawRegion.Clip(Bounds);
+								++Entry.BoundsOnlyMasks;
 							}
 						}
 					}
@@ -296,4 +311,39 @@ FVaCuusGlassMapping VaCuusMakeGlassMapping(
 	}
 
 	return Mapping;
+}
+
+FMatrix44f VaCuusMakeGlassMaskMatrix(const FVaCuusGlassEntry& Entry, const FVaCuusGlassMapping& Mapping, FIntPoint OutputExtent)
+{
+	// Row-vector composition, left to right = application order: the mask's border-box
+	// offset in view pixels, the clip element's own transform, the live DestRect mapping
+	// into output pixels, then the ortho. See the declaration for why the perspective
+	// divide is safe to leave to the GPU at the end of this chain.
+	FMatrix44f MaskToView = FMatrix44f::Identity;
+	MaskToView.M[3][0] = Entry.MaskTranslation.X;
+	MaskToView.M[3][1] = Entry.MaskTranslation.Y;
+
+	FMatrix44f ViewToOutput = FMatrix44f::Identity;
+	ViewToOutput.M[0][0] = Mapping.Scale.X;
+	ViewToOutput.M[1][1] = Mapping.Scale.Y;
+	ViewToOutput.M[3][0] = Mapping.Offset.X;
+	ViewToOutput.M[3][1] = Mapping.Offset.Y;
+
+	return MaskToView * Entry.MaskTransform * ViewToOutput * VaCuusReplay::MakePixelToClipMatrix(OutputExtent);
+}
+
+bool VaCuusGlassDrawMatchesEntry(const TSharedPtr<const FVaCuusGeometryData>& SourceGeometry, const FIntRect& SourceQuad, const FVaCuusGlassEntry& Entry)
+{
+	// Identity by SHARED POINTER rather than by raw address: holding the reference is what
+	// makes the comparison mean "the same payload", where a bare pointer would also match a
+	// freed payload whose allocation had been handed out again.
+	if (SourceGeometry != Entry.MaskGeometry)
+	{
+		return false;
+	}
+
+	// A square entry has no geometry, so the quad generated from its DrawRegion IS its whole
+	// identity. A rounded entry's DrawRegion may move freely without touching its vertices --
+	// the draw is scissored to that region, not built from it.
+	return Entry.MaskGeometry.IsValid() || SourceQuad == Entry.DrawRegion;
 }
