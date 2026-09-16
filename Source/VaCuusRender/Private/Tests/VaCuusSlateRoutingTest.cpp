@@ -267,6 +267,21 @@ static FPointerEvent MakePointerEvent(const FVector2D& Position, const TSet<FKey
 }
 
 /**
+ * A touch event as FSlateApplication would build one.
+ *
+ * bIsTouchEvent is the whole point: it is what makes FSlateApplication offer the press to OnTouchStarted
+ * before OnMouseButtonDown, so a reply asserted after routing one of these is the touch call site's own.
+ * The constructor also bakes {LeftMouseButton} into PressedButtons, for the release as much as the press
+ * -- see VaCuusTouchInputTest.cpp's copy of this helper for that argument in full.
+ */
+static FPointerEvent MakeTouchEvent(const FVector2D& Position, uint32 SlateUserIndex, uint32 FingerIndex = 0)
+{
+	return FPointerEvent(SlateUserIndex, FingerIndex, Position, Position,
+		/*InForce=*/1.0f, /*bPressLeftMouseButton=*/true, /*bInIsForceChanged=*/false, /*bInIsFirstMove=*/false,
+		FModifierKeysState());
+}
+
+/**
  * The process-wide capture holder as a raw pointer (bead VaCuus-akj.6.41).
  *
  * WHY IT IS ASSERTED BESIDE EVERY IsTrackingMouseCapture_Debug() BELOW: the static is what the
@@ -1868,6 +1883,40 @@ bool FVaCuusPressFocusTest::RunTest(const FString& Parameters)
 	// 4. The widget holding focus keeps it; whether the button keeps RmlUi focus is RmlUi's call.
 	Click(GPanelPoint);
 	TestSamePtr(TEXT("A press on the panel leaves focus on the widget"), FocusedWidget(), ThisWidget);
+
+	// 5. THE FINGER. OnTouchStarted reaches the same AnswerPointerDown, so blocks 2 and 3 are the finger's
+	// rules too -- but nothing had ever driven a touch press through real routing, so the shared path was
+	// an assumption rather than a fact, and the touch call site was the one AnswerPointerDown caller with
+	// no coverage of its reply at all. FSlateApplication offers a touch FPointerEvent to OnTouchStarted
+	// first and falls back to OnMouseButtonDown only if that answers Unhandled, so what is asserted below
+	// is the touch call site's own answer.
+	//
+	// WHAT THIS DOES NOT COVER: the user index that call site passes. Every Slate user within reach is the
+	// cursor's -- FSlateApplication::RegisterNewUser is protected, so a test cannot stand a second one up,
+	// and no touch platform produces a finger on a non-zero user anyway. A call site that hard-coded 0
+	// would pass this block. Said out loud because the user index is exactly what this branch added here.
+	{
+		Slate.SetUserFocus(UserIndex, OtherHolder, EFocusCause::SetDirectly);
+		if (!TestSamePtr(TEXT("The button off the path holds focus before the tap"), FocusedWidget(), OtherWidget))
+		{
+			return false;
+		}
+
+		const auto Tap = [&Slate, &WidgetPath, &WidgetGeometry, UserIndex](const FVector2D& ViewPixel)
+		{
+			const FVector2D ScreenPosition(WidgetGeometry.LocalToAbsolute(ViewPixel / WidgetGeometry.Scale));
+			const FReply Reply = Slate.RoutePointerDownEvent(WidgetPath, MakeTouchEvent(ScreenPosition, UserIndex));
+			Slate.RoutePointerUpEvent(WidgetPath, MakeTouchEvent(ScreenPosition, UserIndex));
+			return Reply;
+		};
+
+		TestTrue(TEXT("A tap on the panel is Handled"), Tap(GPanelPoint).IsEventHandled());
+		TestSamePtr(TEXT("...and leaves focus on the button"), FocusedWidget(), OtherWidget);
+
+		// D11 through the finger: a focusable rect takes the keyboard for a tap as for a click.
+		Tap(GButtonPoint);
+		TestSamePtr(TEXT("A tap on the focusable button focuses the widget"), FocusedWidget(), ThisWidget);
+	}
 
 	UIThread->EnqueueRemoveView(ViewId);
 	TestTrue(TEXT("UI frames survive the removal"), RunFrames(*UIThread, 2));
