@@ -847,6 +847,11 @@ FReply SVaCuusWidget::AnswerPointerDown(FIntPoint Position, uint32 UserIndex)
 	// not clear Slate focus. If a text field had it, RmlUi's own press handling decides
 	// whether the field keeps RmlUi focus, and holding Slate focus while it does is
 	// exactly right.
+	//
+	// That is not free, though -- the else branch below has to ASK for it. Left to itself
+	// Slate focuses the leaf-most widget under the pointer that supports keyboard focus
+	// (SlateApplication.cpp:5485-5505), and this widget always does, so a reply that names
+	// no recipient hands the keyboard here anyway.
 	if (Snapshot.IsFocusableAt(Position))
 	{
 		Reply.SetUserFocus(SharedThis(this), EFocusCause::Mouse);
@@ -859,8 +864,8 @@ FReply SVaCuusWidget::AnswerPointerDown(FIntPoint Position, uint32 UserIndex)
 	}
 	else
 	{
-		// A reply that names no recipient is not enough: Slate then focuses the leaf-most widget under the
-		// pointer that supports keyboard focus (SlateApplication.cpp:5485-5505), and that is always this one.
+		// Naming the current holder is how the note above is kept: it changes nothing and suppresses
+		// the fallback. See FindPressFocusRecipient for why it must be that widget and no other.
 		if (const TSharedPtr<SWidget> FocusRecipient = FindPressFocusRecipient(UserIndex))
 		{
 			Reply.SetUserFocus(FocusRecipient.ToSharedRef(), EFocusCause::Mouse);
@@ -1633,36 +1638,38 @@ void SVaCuusWidget::TickAnalogNavigation(double InCurrentTime)
 
 TSharedPtr<SWidget> SVaCuusWidget::FindPressFocusRecipient(uint32 UserIndex) const
 {
+	check(IsInGameThread());
+
 	if (!FSlateApplication::IsInitialized())
 	{
 		return nullptr;
 	}
 
-	// A holder on this widget's own path keeps focus. Naming it is a no-op -- SetUserFocus returns before any
-	// focus event (SlateApplication.cpp:3029-3033) -- so the game viewport gets no OnFocusLost and does not
-	// flush its pressed keys (GameViewportClient.cpp:2632-2649).
-	const TSharedPtr<SWidget> Focused = FSlateApplication::Get().GetUserFocusedWidget(UserIndex);
-	if (Focused.Get() == this)
-	{
-		return Focused;
-	}
-
-	// Any other holder loses focus to the widget Slate would pick if this one did not support focus.
-	TSharedPtr<SWidget> NearestFocusable;
-	for (TSharedPtr<SWidget> Ancestor = GetParentWidget(); Ancestor.IsValid(); Ancestor = Ancestor->GetParentWidget())
-	{
-		if (Ancestor == Focused)
-		{
-			return Focused;
-		}
-
-		if (!NearestFocusable.IsValid() && Ancestor->SupportsKeyboardFocus())
-		{
-			NearestFocusable = Ancestor;
-		}
-	}
-
-	return NearestFocusable;
+	// WHOEVER ALREADY HAS IT, and nobody else. Naming the current holder is a no-op in every case --
+	// SetUserFocus returns before any focus event once the leaf-most focusable widget on the path it
+	// builds is already OldFocusedWidget (SlateApplication.cpp:3029-3033) -- while still counting as a
+	// recipient, which is the only thing Slate's fallback looks at (SlateApplication.cpp:5488-5489).
+	// So the press suppresses the fallback and moves nothing.
+	//
+	// NAMING ANYONE ELSE COSTS THIS PRESS ITS OWN MOUSE CAPTURE, which is why the ancestor walk this
+	// replaced could not stay. The reply above already asked for capture; ProcessReply grants it at
+	// SlateApplication.cpp:3501 and applies the focus recipient afterwards at :3713-3723. A recipient
+	// that is NOT the current holder is a real focus change, so Slate calls OnFocusReceived on it and
+	// processes ITS reply too (SlateApplication.cpp:3167-3171) -- and for the game viewport that reply
+	// is AcquireFocusAndCapture (SceneViewport.cpp:1392-1440 -> :731-751), whose CaptureMouse lands in
+	// FSlateUser::SetPointerCaptor, whose first statement is ReleaseCapture (SlateUser.cpp:256-259).
+	// The press's capture dies inside the press, OnMouseCaptureLost sends RmlUi a MouseLeave, and the
+	// drag the player just started is over. VaCuus.Input.PressFocus's third block is the observable.
+	//
+	// The condition that arms it is the default one: EMouseCaptureMode::CapturePermanently
+	// (GameViewportClient.cpp:296) plus EFocusCause::Mouse, and a packaged game takes the !GIsEditor
+	// leg regardless of cause -- so no focus cause dodges it.
+	//
+	// NULL WHEN NOBODY HOLDS FOCUS. Slate's fallback then focuses this widget, exactly as it did
+	// before any of this: there is no game focus to protect and no holder to name, and naming an
+	// ancestor here would buy the better focus target at the price above. Bead VaCuus-dfs tracks
+	// handing that focus back, which bSelfRequestedUserFocus cannot do on a non-focusable rect.
+	return FSlateApplication::Get().GetUserFocusedWidget(UserIndex);
 }
 
 void SVaCuusWidget::TickKeyboardFocusRelease()

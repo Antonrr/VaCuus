@@ -596,10 +596,12 @@ private:
 	void TickKeyboardFocusRelease();
 
 	/**
-	 * Where a press on a rect that is NOT focusable sends the user's focus, so it never lands on this widget
-	 * by default. The current holder if it is this widget or an ancestor; else the nearest ancestor that
-	 * supports keyboard focus, which is what Slate would pick if this widget did not; else null, and Slate's
-	 * default stands.
+	 * Who a press on a rect that is NOT focusable names as its reply's focus recipient: the widget that
+	 * already holds UserIndex's focus, or null when nobody does.
+	 *
+	 * Naming the holder moves no focus and fires no focus event, yet it still stops Slate from handing
+	 * the keyboard to this widget by default. Naming anything else would move focus for real, and the
+	 * .cpp explains why this press cannot afford that. Null is the no-holder case (bead VaCuus-dfs).
 	 */
 	TSharedPtr<SWidget> FindPressFocusRecipient(uint32 UserIndex) const;
 
