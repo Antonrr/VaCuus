@@ -360,6 +360,52 @@ leaves every interactive rect keeps working because the widget holds Slate point
 capture from the press; that is `SVaCuusWidget`'s capture gate, not the snapshot, and it
 is what makes dragging between two panels across empty screen possible.
 
+**25. A loading screen built on VaCuus shows nothing while the level loads.**
+Symptom: a `UVaCuusWidget` inside the engine's stock loading screen — handed to the movie
+player as `FLoadingScreenAttributes::WidgetLoadingScreen`, or a PreLoadScreen widget — draws
+nothing for the whole `LoadMap` and appears only once the load returns. Nothing is logged. PIE
+never shows it, because PIE runs no movie player. (Before `SVaCuusWidget::Tick` learned to
+skip this thread, the same setup killed a packaged game at its first loading screen:
+`Assertion failed: IsInGameThread()` in `UVaCuusView::Resize`, on `SlateLoadingThread1`.)
+Cause: while a level loads, the movie player paints that widget on a Slate thread of its own
+(`MoviePlayer/Private/DefaultGameMoviePlayer.cpp:935` → `:407-409`,
+`MoviePlayerThreading.cpp:168`), and `SWidget::Paint` ticks it there
+(`SlateCore/Private/Widgets/SWidget.cpp:1505-1511`). The widget skips that tick — all of it is
+game-thread work — and keeps compositing whatever the view last published. A `UVaCuusWidget`,
+though, creates its view at 0x0 and takes its size from its first tick
+(`Source/VaCuusRender/Private/VaCuusUMGWidget.cpp:69-76`), and an unsized view records nothing
+(`Source/VaCuusRender/Private/Tests/VaCuusUnsizedDrainTest.cpp:44`). A widget created for the
+loading screen gets its first game-thread tick only after `LoadMap` returns, so until then there
+is no frame to composite.
+This was observed in a packaged game whose movie-player screen is a `UVaCuusWidget`: the
+screen's view loaded its document at `(0x0)` and recorded no frame before the load finished.
+Sized as below, the same view recorded its first frame inside `LoadMap`, and the screen was
+up for the whole load.
+Do: size the view yourself, on the game thread, before its document loads — the load carries
+the size along (`Source/VaCuus/Private/VaCuusView.cpp:181`). The movie player draws at the
+client size of its window (`DefaultGameMoviePlayer.cpp:384`), and that window is the game's
+(`:239`, `:300`):
+
+```cpp
+if (const UGameEngine* GameEngine = Cast<UGameEngine>(GEngine))
+{
+    if (const TSharedPtr<SWindow> Window = GameEngine->GameViewportWindow.Pin())
+    {
+        const FVector2D Size = Window->GetClientSizeInScreen();
+        View->Resize(FIntPoint(FMath::RoundToInt32(Size.X), FMath::RoundToInt32(Size.Y)));
+    }
+}
+```
+
+The game viewport is no substitute: at the session's first load neither
+`UGameViewportClient::GetViewportSize` nor `UGameViewportClient::GetWindow()` gave a size there.
+Queued commands wake the UI thread by themselves (`Source/VaCuus/Private/VaCuusUIThread.cpp:924-925`),
+so the document is laid out and drawn during the load. What stays still is everything the game
+drives: the per-frame pulse is `UVaCuusSubsystem::Tick`
+(`Source/VaCuus/Private/VaCuusSubsystem.cpp:196`), which does not run inside `LoadMap`, so model
+updates — and a spinner fed from one — resume only when the load returns. An RCSS animation
+needs that pulse too. (Engine line numbers are 5.8.)
+
 ## Data binding and JS
 
 **9. Your data model binds to nothing, one Error at load time.**

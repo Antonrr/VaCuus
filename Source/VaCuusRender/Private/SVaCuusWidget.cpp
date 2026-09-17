@@ -243,6 +243,34 @@ void SVaCuusWidget::ReleaseOwnPointerCapture(const TCHAR* Reason)
 
 void SVaCuusWidget::Tick(const FGeometry& AllottedGeometry, const double InCurrentTime, const float InDeltaTime)
 {
+	// NOT ON THE SLATE LOADING THREAD, and Slate does call this from there. A widget inside a
+	// loading screen handed to the movie player (FLoadingScreenAttributes::WidgetLoadingScreen)
+	// or to PreLoadScreen is painted by a dedicated thread while the game thread is inside
+	// LoadMap: OnPreLoadMap's PlayMovie starts it (DefaultGameMoviePlayer.cpp:935, :407-409), it
+	// claims GSlateLoadingThreadId and tags itself ESlateThread (MoviePlayerThreading.cpp:195,
+	// :208; PreLoadSlateThreading.cpp:26, :35) and draws the window
+	// (MoviePlayerThreading.cpp:168), and SWidget::Paint ticks every
+	// widget on the way down -- NeedsTick is the default (SWidget.cpp:246, :1505-1511).
+	// IsInGameThread() is false there (ThreadingBase.cpp:190-207).
+	//
+	// Everything below belongs to the game thread. Resize() asserts it (VaCuusView.cpp:328), and
+	// so do PushImeSurface and TickVirtualKeyboard; the view is a weak UObject pointer, and the
+	// LoadMap running beside this collects garbage (UnrealEngine.cpp:16315 -> :16729); the
+	// command queue Resize() feeds has exactly one producer, the game thread, and this Tick is
+	// named as one of its parts (VaCuusUIQueues.h:328-330). With checks compiled out, the first
+	// two stop asserting and the last two become data races.
+	//
+	// So the loading thread skips the tick entirely, including TickLog, whose window is
+	// game-thread bookkeeping too. Nothing is lost that this thread could have used: the UI
+	// thread's per-frame pulse is UVaCuusSubsystem::Tick (VaCuusSubsystem.cpp:196), which does
+	// not run inside LoadMap either, so OnPaint keeps compositing whatever the view last
+	// published. Nothing is latched either: the next game-thread tick sends whatever size
+	// changed in between.
+	if (!IsInGameThread())
+	{
+		return;
+	}
+
 	{
 		// The other half of the spec's game-thread budget (Task 14): the per-frame work a
 		// HOSTED view costs, next to UVaCuusSubsystem::Tick's snapshot poll. The scope stops
@@ -341,6 +369,19 @@ int32 SVaCuusWidget::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGe
 	const FSlateRect& MyCullingRect, FSlateWindowElementList& OutDrawElements, int32 LayerId,
 	const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const
 {
+	// THE SLATE LOADING THREAD PAINTS, BUT DOES NOT SAMPLE. It reaches here by the path Tick
+	// describes, and the composite is what it should keep doing: the view's last published
+	// frame is exactly what a loading screen can show. Enqueueing a render command from that
+	// thread is what the engine's own loading draw does
+	// (DefaultGameMoviePlayer.cpp:1040 -> SlateRHIRenderer.cpp:1406 -> :1749). The OnPaint
+	// scope is what it must not touch: it is a game-thread budget row
+	// (VaCuusStats.cpp:82), and its last-sample slot relies on having exactly one writing
+	// thread (VaCuusStats.cpp:202-203).
+	if (!IsInGameThread())
+	{
+		return PaintViewElement(AllottedGeometry, OutDrawElements, LayerId);
+	}
+
 	// The widget's last unscoped PER-PAINT entry point gains its scope (M6 Task 4,
 	// bead VaCuus-akj.6.38): the arch spec's game-thread budget row is a SUM of the GT
 	// scopes, and OnPaint -- the rect/HDR read, the render-command enqueue, MakeCustom
@@ -351,7 +392,12 @@ int32 SVaCuusWidget::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGe
 	// still carry no scope -- arch:369's stated unmeasured remainder of rare-event
 	// cost, not part of any per-frame sum.
 	VACUUS_PERF_SCOPE(OnPaint);
+	return PaintViewElement(AllottedGeometry, OutDrawElements, LayerId);
+}
 
+int32 SVaCuusWidget::PaintViewElement(const FGeometry& AllottedGeometry, FSlateWindowElementList& OutDrawElements,
+	int32 LayerId) const
+{
 	// Window-space pixel rect of the widget (shared with Tick's frame size).
 	// The element applies the elements-texture offset render-side
 	// (FDrawPassInputs::ElementsOffset), mirroring the Slate blur pass.
