@@ -115,7 +115,9 @@ private:
  * window-space composite rect to the Slate element and injects the element into the
  * draw list via FSlateDrawElement::MakeCustom. The UI thread publishes frames
  * asynchronously straight to the render thread, and the once-per-frame pulse belongs
- * to UVaCuusSubsystem, so Tick does no UI work beyond the resize check.
+ * to UVaCuusSubsystem, so Tick does no UI work beyond the resize check. On the Slate
+ * loading thread -- a widget inside a movie-player or PreLoadScreen loading screen -- Tick
+ * returns at once and OnPaint only composites; Tick's comment says why.
  *
  * INPUT SIDE -- the whole contract in three sentences: every handler converts to
  * view-space pixels, queues the event for the UI thread, and answers Slate
@@ -402,6 +404,13 @@ private:
 	 * and stretch the UI.
 	 */
 	static FIntRect ComputeWindowRect(const FGeometry& Geometry);
+
+	/**
+	 * OnPaint's work without OnPaint's scope: the rect and HDR read, the render-command
+	 * enqueue and the custom element. A separate function because the Slate loading thread
+	 * paints this widget too and must do exactly this much and no more; OnPaint says why.
+	 */
+	int32 PaintViewElement(const FGeometry& AllottedGeometry, FSlateWindowElementList& OutDrawElements, int32 LayerId) const;
 
 	/**
 	 * Screen space -> view-space pixels, the space the snapshot's rects and RmlUi's

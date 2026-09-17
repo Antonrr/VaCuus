@@ -190,5 +190,7 @@ without rendering it, is a guess — mark it as one.
 - A language switch moved some strings and not others → `gotchas.md` #21; parse-time text
   translates once, at load.
 - Works uncooked, breaks packaged → `gotchas.md` #16 and #19.
+- A loading screen is empty while the level loads → `gotchas.md` #25; size the view before
+  its document loads.
 - Editor dies at startup with `exit 127` and no callstack → `gotchas.md` #20; it is a stale
   module binary in a source-built engine, not your UI.
