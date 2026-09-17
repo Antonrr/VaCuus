@@ -55,8 +55,8 @@ questions are already answered in it, with the location, before the agent forms 
 
 This does not cover everything, and the shipped docs are explicit about which parts it
 misses. A property that parses and this renderer does not draw warns differently or not at
-all (`box-shadow` warns once per view and names its substitute; `mask-image` parses, does
-not mask, and paints its artwork over your element). Two failures are genuinely silent: a
+all (`box-shadow` warns once per view and names its substitute; `mask-image` parses and
+does not mask). Two failures are genuinely silent: a
 tween keyword with a capital letter, and `var()` inside a `transition` value. Telling those
 three classes apart is [§1 of the AI guide](/docs/ai-guide).
 

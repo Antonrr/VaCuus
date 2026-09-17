@@ -19,14 +19,18 @@ background and border, exactly as if you had not written the property. One Warni
 view names the property and the substitute.
 Cause: RmlUi builds a box-shadow by rendering it into an off-screen layer and asking the
 renderer to hand that layer back as a texture — `SaveLayerAsTexture`
-(`Source/ThirdParty/RmlUi/Source/Core/GeometryBoxShadow.cpp:235`). VaCuus has no layer
+(`Source/ThirdParty/RmlUi/Source/Core/GeometryBoxShadow.cpp:241`). VaCuus has no layer
 render targets: `PushLayer`/`CompositeLayers`/`PopLayer` are recorded and then skipped at
 replay, so there is no layer to capture. Implementing the capture alone would not help —
-the shadow's blur is a filtered composite and its shape is cut with a clip mask, and
-neither of those is applied at replay either, so it would come out as a hard-edged
-rectangle painted over the element. Refusing is the honest answer for v1.
+the shadow's blur is a filtered composite, and that is not applied at replay either, so
+the shadow would come out hard-edged. Refusing is the honest answer for v1.
 Do: use `decorator: ninepatch(...)` with a pre-blurred shadow image (the standard game-UI
 substitute, and cheaper), or `font-effect: glow` for text.
+*Older builds also flashed the shadow in the view's top-left corner.* RmlUi draws the
+shadow into its layer before asking for it back, and with the layer skipped those draws
+reached the screen at texture coordinates, once per new shadow value — so a shadow set on
+`:hover` flashed there on every hover. The refusal now discards them
+(`VaCuus.Render.LayerCapture.RefusedDrawsDiscarded`, fixed 2026-09-17).
 **Also, separately: a box-shadow TRANSITION does nothing even where shadows render** —
 RmlUi refuses the key at animation start with a Warning, not an error
 (`Source/ThirdParty/RmlUi/Source/Core/ElementAnimation.cpp:640-648`), and `vacuus lint`
@@ -36,17 +40,18 @@ wrong about the bigger half. Fixed 2026-08-05 (bead VaCuus-u0q), which also fixe
 plugin — until then a shadowed element rendered as an opaque WHITE rectangle over its own
 background and border, and forced a published frame on every single tick.*
 
-**2b. `mask-image` parses, does not mask, and paints its artwork over your element.**
-Symptom: the element is unmasked, and whatever you used as the mask (a gradient, an image)
-is visible on top of it. One Warning per view.
+**2b. `mask-image` parses and does not mask.**
+Symptom: the element renders unmasked, as if you had not written the property. One Warning
+per view.
 Cause: the same wall as #2, one door along. RmlUi draws the mask decorators into a pushed
 layer and asks for that layer back as a filter — `SaveLayerAsMaskImage`
-(`Source/ThirdParty/RmlUi/Source/Core/ElementEffects.cpp:306`). With no real layer, the
-mask artwork's draws land in the frame like any other geometry, and the composite runs
-with no mask filter. Unlike #2 there is nothing to make harmless short of implementing the
-capture, so the warning is the whole fix for v1 (bead `VaCuus-iuv`).
+(`Source/ThirdParty/RmlUi/Source/Core/ElementEffects.cpp:306`). With no real layer there is
+nothing to hand back, so the composite runs with no mask filter (bead `VaCuus-iuv`); the
+refusal discards the mask artwork's draws.
 Do: bake the alpha into the image asset and use `decorator: image` or `ninepatch`, or clip
 with `overflow: hidden` plus `border-radius`.
+*Older builds painted the mask artwork over the element*: with the layer skipped, those
+draws landed in the frame like any other geometry. Fixed 2026-09-17, same test as #2.
 
 **3. `transition: opacity 0.3s ease-in-out;` drops the ENTIRE declaration — there is no
 `ease` family in RmlUi.**

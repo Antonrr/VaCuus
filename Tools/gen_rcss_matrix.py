@@ -56,20 +56,21 @@ ANNOTATIONS = {
     "time and re-blurred every engine frame at composite time (arch spec 5, M5 amendment). "
     "Non-blur backdrop filters are refused like element filters.",
     "box-shadow": "DOES NOT RENDER in v1 -- the shadow needs the current layer captured to a "
-    "texture (GeometryBoxShadow.cpp:235 -> RenderInterface::SaveLayerAsTexture) and the replayer "
+    "texture (GeometryBoxShadow.cpp:241 -> RenderInterface::SaveLayerAsTexture) and the replayer "
     "has no layer render targets. It is REFUSED, once per view, with a Warning naming the property "
     "and the substitute; the element then renders its normal background and border with the shadow "
     "dropped (bead VaCuus-u0q; VaCuus patch #3 to the vendored RmlUi is what makes the failure "
     "harmless -- before it the element rendered as an opaque WHITE rectangle and republished every "
-    "frame). Substitute: `decorator: ninepatch(...)` with a pre-blurred shadow image, or "
+    "frame). The refusal also discards what RmlUi drew into the layer for the capture -- before "
+    "that, the shadow flashed in the view's top-left corner once per new shadow value. Substitute: `decorator: ninepatch(...)` with a pre-blurred shadow image, or "
     "`font-effect: glow` for text. Also NOT animatable even where it renders: RmlUi refuses the key "
     "at animation start with a Warning (ElementAnimation.cpp:640-648); `vacuus lint` flags it at "
     "authoring time (Web/packages/cli/lib/lint.mjs:68-99).",
     "mask-image": "PARSES BUT DOES NOT MASK in v1 -- masking needs the mask layer captured as a "
     "filter (ElementEffects.cpp:306 -> RenderInterface::SaveLayerAsMaskImage) and the replayer has "
     "no layer render targets. It is REFUSED, once per view, with a Warning (bead VaCuus-iuv). The "
-    "element renders UNMASKED **and the mask artwork is drawn over it**, because the layer the "
-    "decorators were drawn into is not a real render target -- verified on screen, not inferred. "
+    "element renders UNMASKED, and the mask artwork RmlUi drew for the capture is discarded with the "
+    "refusal -- before that, it was drawn over the element. "
     "Substitute: bake the alpha into the image asset and use `decorator: image`/`ninepatch`, or "
     "clip with `overflow: hidden` plus `border-radius`.",
     "font-effect": "Glyph generation for effects (glow/outline) is the measured spike class -- "
@@ -315,7 +316,8 @@ def main():
     w.append("and `SaveLayerAsMaskImage` (RenderInterface.h:112-116). Both mean \"hand me the")
     w.append("current layer back\", and this renderer has no layer to hand back: PushLayer,")
     w.append("CompositeLayers and PopLayer are recorded and then skipped at replay, so every")
-    w.append("draw between a push and a pop lands directly in the base render target. Glass")
+    w.append("draw between a push and a pop lands directly in the base render target -- except")
+    w.append("the draws RmlUi made only to be captured, which each refusal discards. Glass")
     w.append("(`backdrop-filter`) does not need them -- it is distilled from the buffer and")
     w.append("composited per engine frame -- which is why it ships and these do not.")
     w.append("")
@@ -326,11 +328,12 @@ def main():
     w.append("|---|---|---|")
     w.append("| `box-shadow` | `SaveLayerAsTexture` | Shadow dropped; the element renders its "
              "**normal background and border**. No per-frame cost. |")
-    w.append("| `mask-image` | `SaveLayerAsMaskImage` | Element renders **unmasked**, and the "
-             "mask artwork is **drawn over it**. |")
+    w.append("| `mask-image` | `SaveLayerAsMaskImage` | Element renders **unmasked**; the "
+             "mask artwork is not drawn. |")
     w.append("")
-    w.append("Both are pinned by automation: `VaCuus.Render.LayerCapture.Refused` and")
-    w.append("`VaCuus.Render.LayerCapture.RestyleChurn`.")
+    w.append("Both are pinned by automation: `VaCuus.Render.LayerCapture.Refused`,")
+    w.append("`VaCuus.Render.LayerCapture.RestyleChurn` and")
+    w.append("`VaCuus.Render.LayerCapture.RefusedDrawsDiscarded`.")
     w.append("")
     w.append("## At-rules")
     w.append("")
