@@ -404,7 +404,22 @@ so the document is laid out and drawn during the load. What stays still is every
 drives: the per-frame pulse is `UVaCuusSubsystem::Tick`
 (`Source/VaCuus/Private/VaCuusSubsystem.cpp:196`), which does not run inside `LoadMap`, so model
 updates — and a spinner fed from one — resume only when the load returns. An RCSS animation
-needs that pulse too. (Engine line numbers are 5.8.)
+needs that pulse too.
+Do not: drive the view from anything else Slate runs on that thread. **Your own widgets tick
+there too** — an `SWidget` subclass's `Tick`, a `UUserWidget`'s `NativeTick`
+(`UMG/Private/Slate/SObjectWidget.cpp:128`) and the Blueprint tick it routes all arrive by the
+same `SWidget::Paint` path — and every mutator on `UVaCuusView` is game-thread-only: `Resize`,
+`UpdateModel`, `LoadDocument`, `BindModel`, `CallJs`, `ExecuteScript`, `SetVisible`, `Close`.
+This is how the packaged game above died in the first place: `UVaCuusView::UpdateModel`, called
+from the game's own loading-screen tick code, on `SlateLoadingThread1`. Guarding that one call
+only moved the crash on to the widget's own tick, which is what the fix above answers — your
+code needs the guard whether or not the plugin has one. Use `IsInGameThread()`, and use it for
+the reason that outlives your editor build: in Development the view's assertion catches you,
+but `check()` compiles out in Shipping (`Source/VaCuus/Private/VaCuusView.cpp:328`), and what
+is left is a second producer on a single-producer command queue
+(`Source/VaCuus/Private/VaCuusUIQueues.h:328-330`): a corrupted queue with no assertion and —
+unlike #14 — no log line standing in for it. The configuration that ships is the one that says
+nothing. (Engine line numbers are 5.8.)
 
 ## Data binding and JS
 

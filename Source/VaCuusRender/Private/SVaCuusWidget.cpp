@@ -372,9 +372,14 @@ int32 SVaCuusWidget::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGe
 	// THE SLATE LOADING THREAD PAINTS, BUT DOES NOT SAMPLE. It reaches here by the path Tick
 	// describes, and the composite is what it should keep doing: the view's last published
 	// frame is exactly what a loading screen can show. Enqueueing a render command from that
-	// thread is what the engine's own loading draw does
-	// (DefaultGameMoviePlayer.cpp:1040 -> SlateRHIRenderer.cpp:1406 -> :1749). The OnPaint
-	// scope is what it must not touch: it is a game-thread budget row
+	// thread is what the engine's own loading draw does (DefaultGameMoviePlayer.cpp:1040 ->
+	// FSlateRHIRenderer::DrawWindows, SlateRHIRenderer.cpp:1400 -> DrawWindows_Private, :1509
+	// -> its ENQUEUE_RENDER_COMMAND, :1746), and the enqueue is multi-producer by
+	// construction rather than by luck: FRenderThreadCommandPipe::EnqueueAndLaunch appends
+	// under a mutex (RenderingThread.cpp:1912-1914), and CheckNotBlockedOnRenderThread()
+	// exempts every thread but the game thread (RenderingThread.h:81) -- which is what makes
+	// this legal WHILE the LoadMap beside it sits blocked in FlushRenderingCommands. The
+	// OnPaint scope is what it must not touch: it is a game-thread budget row
 	// (VaCuusStats.cpp:82), and its last-sample slot relies on having exactly one writing
 	// thread (VaCuusStats.cpp:202-203).
 	if (!IsInGameThread())
