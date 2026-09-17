@@ -33,7 +33,7 @@ Plugins/VaCuus/docs/buyer/rcss-matrix.md.
      `ease` family in RCSS, and one bad token discards the **whole** declaration.
    - *Parsed, then not drawn* → the property is legal and this renderer does not implement
      it. `box-shadow` is the headline case (it warns per view and names a substitute);
-     `mask-image` parses, does not mask, and paints its artwork over your element.
+     `mask-image` parses and does not mask.
    - *Genuinely silent* → the small dangerous set. A tween keyword with a capital letter
      (`Cubic-Out`) kills a transition without a word, because `transition` does not
      lowercase its tokens and `animation` does. `var()` inside a `transition` value is the

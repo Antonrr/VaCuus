@@ -1318,9 +1318,12 @@ Rml::LayerHandle FVaCuusRecordingRenderInterface::PushLayer()
 
 	const FVaCuusLayerHandle Handle = NextLayerHandle++;
 
-	FVaCuusCommand& Command = GetPending().Commands.AddDefaulted_GetRef();
+	TArray<FVaCuusCommand>& Commands = GetPending().Commands;
+	FVaCuusCommand& Command = Commands.AddDefaulted_GetRef();
 	Command.Type = EVaCuusCommandType::PushLayer;
 	Command.SourceLayer = Handle;
+
+	OpenLayerCommandStarts.Push(Commands.Num());
 
 	return Rml::LayerHandle(Handle);
 }
@@ -1368,13 +1371,74 @@ void FVaCuusRecordingRenderInterface::PopLayer()
 
 	FVaCuusCommand& Command = GetPending().Commands.AddDefaulted_GetRef();
 	Command.Type = EVaCuusCommandType::PopLayer;
+
+	// RmlUi pops only what it pushed (RenderManager.cpp:310-315 asserts its own stack is not
+	// empty), so the guard is for a push this recorder dropped outside a frame.
+	if (OpenLayerCommandStarts.Num() > 0)
+	{
+		OpenLayerCommandStarts.Pop(EAllowShrinking::No);
+	}
+}
+
+void FVaCuusRecordingRenderInterface::DiscardDrawsInTopLayer()
+{
+	if (OpenLayerCommandStarts.Num() == 0)
+	{
+		return;
+	}
+
+	// Only the two draw types go. Scissor, transform and clip-mask commands stay: after a capture
+	// RmlUi restores its render state through setters that send only what differs from the state
+	// it believes it already sent (GeometryBoxShadow.cpp:244 -> RenderManager.cpp:178-185, the
+	// setters at :95-112 and :135-153), so dropping them would leave the replayer in a state RmlUi
+	// does not know about. A stencil write paints nothing. Resources travel in the buffer's side
+	// arrays, not in Commands, so no creation or release is lost either.
+	TArray<FVaCuusCommand>& Commands = GetPending().Commands;
+	bool bDiscardedExternalDraw = false;
+	int32 Kept = OpenLayerCommandStarts.Last();
+	for (int32 Index = Kept; Index < Commands.Num(); ++Index)
+	{
+		const FVaCuusCommand& Command = Commands[Index];
+		if (Command.Type == EVaCuusCommandType::DrawGeometry || Command.Type == EVaCuusCommandType::DrawShader)
+		{
+			bDiscardedExternalDraw |= (Command.Type == EVaCuusCommandType::DrawGeometry && ExternalTextures.Contains(Command.Texture));
+			continue;
+		}
+
+		if (Kept != Index)
+		{
+			Commands[Kept] = Command;
+		}
+
+		++Kept;
+	}
+
+	Commands.SetNum(Kept, EAllowShrinking::No);
+
+	// ExternalTexturesDrawnThisFrame promises DRAWN, and RenderGeometry filled it for draws that
+	// are now gone — a mask artwork on a live render target would otherwise keep the view
+	// republishing for pixels nobody sees. Rebuilt from what the frame still draws, by
+	// RenderGeometry's own rule. FileTextures' eviction clock is left as recorded: the mask pass
+	// asks for its texture every frame, and RmlUi reloads an evicted one on the next ask
+	// (TextureDatabase.cpp:117-129), so evicting it would only buy a reload.
+	if (bDiscardedExternalDraw)
+	{
+		ExternalTexturesDrawnThisFrame.Reset();
+		for (const FVaCuusCommand& Command : Commands)
+		{
+			if (Command.Type == EVaCuusCommandType::DrawGeometry && Command.Texture != 0 && ExternalTextures.Contains(Command.Texture))
+			{
+				ExternalTexturesDrawnThisFrame.Add(Command.Texture);
+			}
+		}
+	}
 }
 
 Rml::TextureHandle FVaCuusRecordingRenderInterface::SaveLayerAsTexture()
 {
 	CheckOwnerThread();
 
-	// THE ONLY CALLER IN THE TREE is the box-shadow texture callback (GeometryBoxShadow.cpp:235),
+	// THE ONLY CALLER IN THE TREE is the box-shadow texture callback (GeometryBoxShadow.cpp:241),
 	// reached from ElementBackgroundBorder::GenerateGeometry -> BoxShadowCache::GetHandle. Element
 	// `filter:` does NOT come through here — it composites through CompositeLayers
 	// (ElementEffects.cpp:283-315), which is implemented.
@@ -1382,20 +1446,27 @@ Rml::TextureHandle FVaCuusRecordingRenderInterface::SaveLayerAsTexture()
 	// WHY v1 CANNOT HONOUR IT, and why implementing this one virtual alone would be worse than
 	// refusing. "Save the current layer as a texture" presupposes that the layer IS something. In
 	// this replayer it is not: PushLayer/CompositeLayers/PopLayer are recorded and then SKIPPED at
-	// replay (VaCuusReplayRenderer.cpp:720-739), so every draw between a push and a pop lands
+	// replay (VaCuusReplayRenderer.cpp:1414-1433), so every draw between a push and a pop lands
 	// directly in the base render target and there is no off-screen surface to capture. Minting a
 	// handle here would hand RmlUi a texture the replayer can never fill. Standing one up needs
-	// three things this milestone does not have, and the shadow is wrong without ALL of them:
-	//   (a) a real layer RT stack in the replayer, with mid-replay render-pass switching;
+	// two things this milestone does not have, and the shadow is wrong without both:
+	//   (a) a real layer RT stack in the replayer, with mid-replay render-pass switching; and
 	//   (b) CompositeLayers actually applying its filter list — the shadow's blur is a
 	//       CompileFilter("blur") plus a filtered composite (GeometryBoxShadow.cpp:197-231),
-	//       recorded today and never applied, so without it the shadow would be hard-edged; and
-	//   (c) the clip-mask stencil pass — the callback cuts the element's own box out of the shadow
-	//       with SetClipMask(SetInverse, ...) (GeometryBoxShadow.cpp:206, :215, :221), and
-	//       EnableClipMask/RenderToClipMask are likewise recorded and skipped
-	//       (VaCuusReplayRenderer.cpp:741-754), so without it the "shadow" would be a solid rect
-	//       painted over the element. That pass is its own bead (VaCuus-4ik).
+	//       recorded today and never applied, so without it the shadow would be hard-edged.
+	// The third piece, the clip-mask stencil pass the callback cuts the element's own box out of
+	// the shadow with (SetClipMask(SetInverse, ...), GeometryBoxShadow.cpp:206, :221), exists
+	// since bead VaCuus-4ik (VaCuusReplayRenderer.cpp:1447-1552).
 	// So this is a refusal by architecture, not an oversight, and it is loud rather than silent.
+	//
+	// THE REFUSAL TAKES THE CALLBACK'S DRAWS BACK. By the time it is asked for the texture, the
+	// callback has already drawn the texture's content — the element's background and border, then
+	// the shadow — into the layer it pushed (GeometryBoxShadow.cpp:157-233), at texture coordinates
+	// with the transform reset (:137-138). With the layer skipped at replay, those draws were painted
+	// at the view's top-left corner in the frame the callback ran, an inset shadow cut to its exact
+	// shape by the stencil pass. A cache entry lives only while some element uses its exact
+	// shadow (BoxShadowCache.cpp:65-77), so a shadow set on :hover re-ran the callback, and flashed,
+	// on every hover. DiscardDrawsInTopLayer removes them; see OpenLayerCommandStarts.
 	//
 	// RETURNING 0 IS NOW SAFE, which it was not before bead VaCuus-u0q. It reaches
 	// CallbackTextureInterface::SaveLayerAsTexture, which reports the failure to the box-shadow
@@ -1419,6 +1490,8 @@ Rml::TextureHandle FVaCuusRecordingRenderInterface::SaveLayerAsTexture()
 			TEXT("Instead: `decorator: ninepatch(...)` with a pre-blurred shadow image, or `font-effect: glow` for text."));
 	}
 
+	DiscardDrawsInTopLayer();
+
 	return Rml::TextureHandle(0);
 }
 
@@ -1439,11 +1512,12 @@ Rml::CompiledFilterHandle FVaCuusRecordingRenderInterface::SaveLayerAsMaskImage(
 	// simply runs with no mask filter and the element renders UNMASKED. Nothing leaks and nothing
 	// double-releases.
 	//
-	// WHAT THE AUTHOR ACTUALLY SEES, and it is worse than "unmasked" — this is the half the bead
-	// did not predict and a screenshot did. The mask decorators are RENDERED into the pushed layer
-	// before the capture (ElementEffects.cpp:300-305); because the replayer skips the layer, those
-	// draws land in the base render target like any other geometry. So the mask ARTWORK is painted
-	// on top of the element rather than discarded. That is the visible symptom to look for.
+	// THE ARTWORK IS TAKEN BACK TOO. The mask decorators are RENDERED into the pushed layer before
+	// the capture (ElementEffects.cpp:298-306), and because the replayer skips the layer, those
+	// draws would land in the base render target like any other geometry — the mask ARTWORK
+	// painted over the element, which is what a screenshot showed before this refusal discarded
+	// them (DiscardDrawsInTopLayer; see OpenLayerCommandStarts). What remains is the element,
+	// unmasked.
 	NumSaveLayerAsMaskImageCalls.fetch_add(1, std::memory_order_release);
 	if (NumSaveLayerAsMaskImageWarnings.load(std::memory_order_acquire) == 0)
 	{
@@ -1454,10 +1528,12 @@ Rml::CompiledFilterHandle FVaCuusRecordingRenderInterface::SaveLayerAsMaskImage(
 		UE_LOG(LogVaCuus, Warning,
 			TEXT("SaveLayerAsMaskImage: `mask-image` is not supported in v1 — it needs the mask layer captured as a filter, ")
 			TEXT("and this replayer has no layer render targets (PushLayer/CompositeLayers/PopLayer are recorded and skipped). ")
-			TEXT("The element renders UNMASKED and the mask artwork is drawn over it, because the layer it was drawn into is not ")
-			TEXT("a real render target. Instead: bake the alpha into the image asset and use `decorator: image`/`ninepatch`, ")
+			TEXT("The element renders UNMASKED and the mask artwork is not drawn. ")
+			TEXT("Instead: bake the alpha into the image asset and use `decorator: image`/`ninepatch`, ")
 			TEXT("or clip with `overflow: hidden` plus `border-radius`."));
 	}
+
+	DiscardDrawsInTopLayer();
 
 	return Rml::CompiledFilterHandle(0);
 }
@@ -1513,6 +1589,7 @@ void FVaCuusRecordingRenderInterface::BeginFrame(FIntPoint ViewSize)
 	// Layer handles restart every frame — see the declaration for why this is what keeps
 	// a static glass document idle-gated.
 	NextLayerHandle = 1;
+	OpenLayerCommandStarts.Reset();
 
 	// The liveness set is per FRAME, so it is emptied here and refilled by whatever this
 	// frame actually draws. See ExternalTexturesDrawnThisFrame.

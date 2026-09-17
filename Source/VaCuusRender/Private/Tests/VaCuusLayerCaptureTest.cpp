@@ -22,7 +22,7 @@
  *
  * `box-shadow` and `mask-image` are the only two callers in the whole tree of the only two
  * Rml::RenderInterface virtuals VaCuus does not implement — SaveLayerAsTexture
- * (GeometryBoxShadow.cpp:235) and SaveLayerAsMaskImage (ElementEffects.cpp:306). Leaving both at
+ * (GeometryBoxShadow.cpp:241) and SaveLayerAsMaskImage (ElementEffects.cpp:306). Leaving both at
  * their optional zero-returning defaults (RenderInterface.cpp:37-45) is legal by RmlUi's contract
  * and was silent, and for box-shadow it was also destructive in two separate ways:
  *
@@ -60,11 +60,12 @@
  *   - Remove either latch in FVaCuusRecordingRenderInterface and section 4's Warnings count
  *     climbs with the Calls count instead of staying at 1.
  *
- * THE MASK-IMAGE HALF IS A WARNING ONLY, deliberately: masking correctly needs the same layer
- * capture, so there is nothing to make harmless short of implementing it (bead VaCuus-iuv notes
- * the dependency). What section 4 pins is that the refusal is counted every frame and logged
- * once — which is the property most at risk, since RenderEffects reaches it on every frame of
- * every masked element.
+ * THE MASK-IMAGE HALF IS A WARNING PLUS A DISCARD: masking correctly needs the same layer
+ * capture (bead VaCuus-iuv notes the dependency), so the element renders unmasked. What section 4
+ * pins is that the refusal is counted every frame and logged once — which is the property most at
+ * risk, since RenderEffects reaches it on every frame of every masked element. That neither
+ * refusal lets the content drawn for its capture reach the screen is the third test below,
+ * VaCuus.Render.LayerCapture.RefusedDrawsDiscarded.
  */
 namespace VaCuusLayerCaptureTest
 {
@@ -474,6 +475,181 @@ div { display: block; width: 120px; height: 40px; background-color: #3C7896; bor
 	TestEqual(TEXT("and NOT ONCE MORE across sixty restyles -- the callback latched load_failed (u0q)"),
 		int32(Tally.SaveLayerAsTextureCalls), int32(CallsAfterLoad));
 	TestEqual(TEXT("still exactly one log line"), int32(Tally.SaveLayerAsTextureWarnings), 1);
+
+	UIThread->EnqueueRemoveView(ViewId);
+	RunFrames(*UIThread, 1);
+
+	return true;
+}
+
+/**
+ * A REFUSED CAPTURE DRAWS NOTHING OF WHAT WAS DRAWN FOR IT.
+ *
+ * Both captures are preceded by real draws into the layer RmlUi pushed for them: the box-shadow
+ * callback draws the element's background and border and then the shadow itself
+ * (GeometryBoxShadow.cpp:157-233), and the mask pass draws its decorators (ElementEffects.cpp:
+ * 298-306). The replayer skips layers, so without FVaCuusRecordingRenderInterface::
+ * DiscardDrawsInTopLayer those draws reach the screen: the shadow at the view's top-left corner in
+ * the frame its callback runs — once per cache entry, so every hover for a :hover shadow — and the
+ * mask artwork over the element on every frame.
+ *
+ * WHY ALL PUBLISHED BUFFERS, not the last one like Refused above: the shadow callback runs once per
+ * cache entry, in the first frame, and never again on an idle document. The last buffer would pass
+ * on a broken build.
+ *
+ * WHY TWO MARKER COLOURS: each is carried by exactly one of the refused paths and appears nowhere
+ * else in the document, so a drawn vertex of either colour names the refusal that leaked it. Three
+ * shadows — inset, outer, outer with blur — because each takes a different branch of the callback
+ * (GeometryBoxShadow.cpp:195-200 pushes a second layer for the blur; :204-216 is the inset branch,
+ * :217-223 the outer one).
+ *
+ * The controls: the refusals ran, the marker geometry was compiled (so the scan below would see
+ * it if it were drawn), and the elements' own backgrounds are still drawn.
+ */
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVaCuusLayerCaptureRefusedDrawsTest, "VaCuus.Render.LayerCapture.RefusedDrawsDiscarded",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FVaCuusLayerCaptureRefusedDrawsTest::RunTest(const FString& Parameters)
+{
+	using namespace VaCuusLayerCaptureTest;
+
+	if (!FPlatformProcess::SupportsMultithreading())
+	{
+		AddInfo(TEXT("Skipped: no multithreading support, so there is no UI thread to drive"));
+		return true;
+	}
+
+	if (!TestFalse(TEXT("RmlUi is down before the test"), FVaCuusEngine::Get().IsInitialized()))
+	{
+		return false;
+	}
+
+	FVaCuusModule& Module = FVaCuusModule::Get();
+	FVaCuusUIThread* UIThread = Module.GetOrStartUIThread();
+	if (!TestNotNull(TEXT("UI thread"), UIThread))
+	{
+		return false;
+	}
+
+	ON_SCOPE_EXIT
+	{
+		Module.StopUIThread();
+	};
+
+	// Magenta on the shadows, green on the mask. No text and no transforms, like GDocument.
+	static const TCHAR* MarkedDocument = TEXT(R"(<rml>
+<head><style>
+body { display: block; width: 100%; height: 100%; }
+div { display: block; width: 120px; height: 40px; margin: 8px; background-color: #3C7896; }
+#inset { box-shadow: inset 0px 0px 0px 3px #FF00FF; }
+#outer { box-shadow: 6px 6px 0px 2px #FF00FF; }
+#blurred { box-shadow: 4px 4px 8px #FF00FF; }
+#masked { mask-image: horizontal-gradient(#00FF00 #00FF00); }
+</style></head>
+<body>
+	<div id="inset"/>
+	<div id="outer"/>
+	<div id="blurred"/>
+	<div id="masked"/>
+</body>
+</rml>)");
+
+	const TSharedRef<FCaptureSink> Sink = MakeShared<FCaptureSink>();
+	const TSharedRef<FVaCuusViewStatus> Status = MakeShared<FVaCuusViewStatus>();
+
+	TUniquePtr<FVaCuusRmlDocumentHost> OwnedHost = MakeUnique<FVaCuusRmlDocumentHost>(Sink);
+	FVaCuusRmlDocumentHost* Host = OwnedHost.Get();
+
+	const uint32 ViewId = UIThread->AllocateViewId();
+	UIThread->EnqueueAddView(ViewId, MoveTemp(OwnedHost), GViewSize, Status);
+	UIThread->EnqueueLoadDocumentFromMemory(ViewId, MarkedDocument, /*LoadSerial=*/1);
+
+	if (!TestTrue(TEXT("the document loaded and rendered"), RunFrames(*UIThread, 10)))
+	{
+		return false;
+	}
+
+	FlushRenderingCommands();
+
+	if (!TestTrue(TEXT("the sink captured at least one published buffer"), Sink->Buffers.Num() > 0))
+	{
+		return false;
+	}
+
+	const auto CountVertices = [](const FVaCuusGeometryData& Geometry, uint8 R, uint8 G, uint8 B)
+	{
+		int32 Count = 0;
+		for (const FVaCuusVertex& Vertex : Geometry.Vertices)
+		{
+			Count += ColorBytesEqual(Vertex.Color, R, G, B, 0xFF) ? 1 : 0;
+		}
+
+		return Count;
+	};
+
+	// Compiled geometry first, across every buffer — a draw may resolve against an earlier one.
+	TMap<FVaCuusGeometryHandle, const FVaCuusGeometryData*> AllGeometry;
+	int32 CompiledShadowVertices = 0;
+	int32 CompiledMaskVertices = 0;
+	for (const TUniquePtr<FVaCuusCommandBuffer>& Buffer : Sink->Buffers)
+	{
+		for (const TPair<FVaCuusGeometryHandle, FVaCuusGeometryData>& Pair : Buffer->NewGeometry)
+		{
+			AllGeometry.Add(Pair.Key, &Pair.Value);
+			CompiledShadowVertices += CountVertices(Pair.Value, 0xFF, 0x00, 0xFF);
+			CompiledMaskVertices += CountVertices(Pair.Value, 0x00, 0xFF, 0x00);
+		}
+	}
+
+	int32 DrawnShadowVertices = 0;
+	int32 DrawnMaskVertices = 0;
+	for (const TUniquePtr<FVaCuusCommandBuffer>& Buffer : Sink->Buffers)
+	{
+		for (const FVaCuusCommand& Command : Buffer->Commands)
+		{
+			if (Command.Type != EVaCuusCommandType::DrawGeometry)
+			{
+				continue;
+			}
+
+			if (const FVaCuusGeometryData* const* Found = AllGeometry.Find(Command.Geometry))
+			{
+				DrawnShadowVertices += CountVertices(**Found, 0xFF, 0x00, 0xFF);
+				DrawnMaskVertices += CountVertices(**Found, 0x00, 0xFF, 0x00);
+			}
+		}
+	}
+
+	int32 BackgroundVertices = 0;
+	for (const FVaCuusCommand& Command : Sink->Buffers.Last()->Commands)
+	{
+		if (Command.Type != EVaCuusCommandType::DrawGeometry)
+		{
+			continue;
+		}
+
+		if (const FVaCuusGeometryData* const* Found = AllGeometry.Find(Command.Geometry))
+		{
+			BackgroundVertices += CountVertices(**Found, GBackR, GBackG, GBackB);
+		}
+	}
+
+	const FVaCuusUnsupportedTally Tally = Host->GetUnsupportedTally();
+
+	AddInfo(FString::Printf(TEXT("%d published buffers; shadow colour: %d vertices compiled, %d drawn; mask colour: %d compiled, %d "
+								 "drawn; %d background vertices in the last frame; refusals: %u SaveLayerAsTexture, %u "
+								 "SaveLayerAsMaskImage"),
+		Sink->Buffers.Num(), CompiledShadowVertices, DrawnShadowVertices, CompiledMaskVertices, DrawnMaskVertices, BackgroundVertices,
+		Tally.SaveLayerAsTextureCalls, Tally.SaveLayerAsMaskImageCalls));
+
+	TestTrue(TEXT("all three shadows reached the refusal"), Tally.SaveLayerAsTextureCalls >= 3);
+	TestTrue(TEXT("the mask reached its refusal"), Tally.SaveLayerAsMaskImageCalls >= 1);
+	TestTrue(TEXT("the shadow callback compiled shadow-coloured geometry"), CompiledShadowVertices > 0);
+	TestTrue(TEXT("the mask pass compiled mask-coloured geometry"), CompiledMaskVertices > 0);
+	TestTrue(TEXT("the elements still draw their own background"), BackgroundVertices > 0);
+
+	TestEqual(TEXT("no published frame draws the refused shadow texture's content"), DrawnShadowVertices, 0);
+	TestEqual(TEXT("no published frame draws the refused mask's artwork"), DrawnMaskVertices, 0);
 
 	UIThread->EnqueueRemoveView(ViewId);
 	RunFrames(*UIThread, 1);

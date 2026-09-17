@@ -325,6 +325,12 @@ private:
 	/** Ensures the caller is the frame-owning thread while a frame is open. */
 	void CheckOwnerThread() const;
 
+	/**
+	 * Removes every draw recorded since the top layer was pushed, keeping state and clip-mask
+	 * commands. The two capture refusals call it; OpenLayerCommandStarts says why.
+	 */
+	void DiscardDrawsInTopLayer();
+
 	/** Cached ImageWrapper module, or nullptr if it could not be resolved; see CacheImageWrapperModule. */
 	static IImageWrapperModule* GetImageWrapperModule();
 
@@ -343,6 +349,22 @@ private:
 	 * FVaCuusLayerHandle. 0 stays reserved for the base layer (RenderInterface.h:96).
 	 */
 	uint64 NextLayerHandle = 1;
+
+	/**
+	 * PER FRAME, like NextLayerHandle: for each layer pushed and not yet popped, the index in
+	 * the pending buffer's Commands where that layer's content starts.
+	 *
+	 * The replayer skips layers, so a draw "into" one lands in the base render target
+	 * (VaCuusReplayRenderer.cpp:1414-1433). For the filter stack that is the element's own
+	 * content, drawn unfiltered. A layer RmlUi pushes only to CAPTURE it is different: its
+	 * draws are the capture's input, never meant for the screen — the box-shadow texture
+	 * (GeometryBoxShadow.cpp:157-233, captured at :241) and the mask artwork
+	 * (ElementEffects.cpp:298-306). When SaveLayerAsTexture/SaveLayerAsMaskImage refuse, those
+	 * draws have to go too, or they are painted as they stand. The shadow's would land at the
+	 * view's top-left corner, because its callback resets the transform and draws at texture
+	 * coordinates (GeometryBoxShadow.cpp:137-138).
+	 */
+	TArray<int32, TInlineAllocator<4>> OpenLayerCommandStarts;
 
 	uint64 Generation = 0;
 	bool bInFrame = false;
