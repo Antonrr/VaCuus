@@ -1373,7 +1373,9 @@ void FVaCuusRecordingRenderInterface::PopLayer()
 	Command.Type = EVaCuusCommandType::PopLayer;
 
 	// RmlUi pops only what it pushed (RenderManager.cpp:310-315 asserts its own stack is not
-	// empty), so the guard is for a push this recorder dropped outside a frame.
+	// empty), and a push dropped outside a frame is matched by a pop dropped on the same
+	// bInFrame gate above, so neither can unbalance this. The guard is for the one case that
+	// can: a pop whose push was cleared by BeginFrame's Reset, i.e. a pair straddling a frame.
 	if (OpenLayerCommandStarts.Num() > 0)
 	{
 		OpenLayerCommandStarts.Pop(EAllowShrinking::No);
@@ -1401,7 +1403,8 @@ void FVaCuusRecordingRenderInterface::DiscardDrawsInTopLayer()
 		const FVaCuusCommand& Command = Commands[Index];
 		if (Command.Type == EVaCuusCommandType::DrawGeometry || Command.Type == EVaCuusCommandType::DrawShader)
 		{
-			bDiscardedExternalDraw |= (Command.Type == EVaCuusCommandType::DrawGeometry && ExternalTextures.Contains(Command.Texture));
+			bDiscardedExternalDraw |= (Command.Type == EVaCuusCommandType::DrawGeometry && Command.Texture != 0 &&
+									   ExternalTextures.Contains(Command.Texture));
 			continue;
 		}
 
@@ -1421,6 +1424,15 @@ void FVaCuusRecordingRenderInterface::DiscardDrawsInTopLayer()
 	// RenderGeometry's own rule. FileTextures' eviction clock is left as recorded: the mask pass
 	// asks for its texture every frame, and RmlUi reloads an evicted one on the next ask
 	// (TextureDatabase.cpp:117-129), so evicting it would only buy a reload.
+	//
+	// THE MATERIAL TERM IS NOT CLOSED HERE, and deliberately. LiveMaterialShaders is COMPILE-
+	// scoped, not draw-scoped — added at CompileShader (:1241), removed only at ReleaseShader
+	// (:1306), read as bMaterialLive (:1827) — which is the divergence the header already names
+	// at ExternalTexturesDrawnThisFrame. A `mask-image: shader(<key>)` compiles its material at
+	// GenerateElementData (DecoratorShader.cpp:27-35), so discarding its draw leaves the view
+	// forced-republishing every engine frame for pixels that no longer exist — a republish this
+	// discard turned from justified into pointless. Bead VaCuus-kxa owns it: draw-scoping that
+	// table moves the M5 material tier's idle gate for EVERY decorator, not just a masked one.
 	if (bDiscardedExternalDraw)
 	{
 		ExternalTexturesDrawnThisFrame.Reset();

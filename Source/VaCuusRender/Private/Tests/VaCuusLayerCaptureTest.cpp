@@ -503,8 +503,17 @@ div { display: block; width: 120px; height: 40px; background-color: #3C7896; bor
  * (GeometryBoxShadow.cpp:195-200 pushes a second layer for the blur; :204-216 is the inset branch,
  * :217-223 the outer one).
  *
- * The controls: the refusals ran, the marker geometry was compiled (so the scan below would see
- * it if it were drawn), and the elements' own backgrounds are still drawn.
+ * WHY TWO MASKS, and this is the half a colour scan cannot reach on its own: DiscardDrawsInTopLayer
+ * drops DrawGeometry AND DrawShader, and the two mask spellings are exactly that split.
+ * horizontal-gradient is a decorator that renders plain vertex-coloured geometry, so it leaks as
+ * DrawGeometry and the green scan sees it; linear-gradient compiles a SHADER whose colours live in
+ * the desc and in no vertex, so it leaks as DrawShader and NO colour scan could ever see it. Delete
+ * the DrawShader half of the discard and, with only the first mask, all three tests here still
+ * pass — that is why the second one exists.
+ *
+ * The controls: the refusals ran, the marker geometry was compiled and so was the mask's shader (so
+ * the scans below would see either if it were drawn), and the elements' own backgrounds are still
+ * drawn.
  */
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVaCuusLayerCaptureRefusedDrawsTest, "VaCuus.Render.LayerCapture.RefusedDrawsDiscarded",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -545,12 +554,14 @@ div { display: block; width: 120px; height: 40px; margin: 8px; background-color:
 #outer { box-shadow: 6px 6px 0px 2px #FF00FF; }
 #blurred { box-shadow: 4px 4px 8px #FF00FF; }
 #masked { mask-image: horizontal-gradient(#00FF00 #00FF00); }
+#maskedshader { mask-image: linear-gradient(to right, #00FF00, #00FF00); }
 </style></head>
 <body>
 	<div id="inset"/>
 	<div id="outer"/>
 	<div id="blurred"/>
 	<div id="masked"/>
+	<div id="maskedshader"/>
 </body>
 </rml>)");
 
@@ -620,6 +631,27 @@ div { display: block; width: 120px; height: 40px; margin: 8px; background-color:
 		}
 	}
 
+	// THE OTHER MASK SPELLING, and the only reason there are two. A DECORATOR gradient
+	// (horizontal-gradient) is plain vertex-coloured geometry — DecoratorStraightGradient::
+	// RenderElement just renders a Geometry (DecoratorGradient.cpp:180-184) — so it lands in
+	// DrawGeometry and the colour scan above can see it. linear-gradient, radial-gradient and
+	// conic-gradient instead COMPILE A SHADER (DecoratorGradient.cpp:252, :422, :619) and land in
+	// DrawShader, which carries its colours in the shader desc and not in any vertex, so no colour
+	// scan can ever see one. DiscardDrawsInTopLayer drops BOTH draw types, so both need an
+	// observable; this is DrawShader's. Nothing else in this document compiles a shader — the
+	// backgrounds are plain geometry and box-shadow compiles a FILTER, not a shader
+	// (GeometryBoxShadow.cpp:197) — so any DrawShader that survives is the mask's artwork.
+	int32 CompiledShaders = 0;
+	int32 DrawnShaderCommands = 0;
+	for (const TUniquePtr<FVaCuusCommandBuffer>& Buffer : Sink->Buffers)
+	{
+		CompiledShaders += Buffer->NewShaders.Num();
+		for (const FVaCuusCommand& Command : Buffer->Commands)
+		{
+			DrawnShaderCommands += (Command.Type == EVaCuusCommandType::DrawShader) ? 1 : 0;
+		}
+	}
+
 	int32 BackgroundVertices = 0;
 	for (const FVaCuusCommand& Command : Sink->Buffers.Last()->Commands)
 	{
@@ -637,19 +669,21 @@ div { display: block; width: 120px; height: 40px; margin: 8px; background-color:
 	const FVaCuusUnsupportedTally Tally = Host->GetUnsupportedTally();
 
 	AddInfo(FString::Printf(TEXT("%d published buffers; shadow colour: %d vertices compiled, %d drawn; mask colour: %d compiled, %d "
-								 "drawn; %d background vertices in the last frame; refusals: %u SaveLayerAsTexture, %u "
-								 "SaveLayerAsMaskImage"),
-		Sink->Buffers.Num(), CompiledShadowVertices, DrawnShadowVertices, CompiledMaskVertices, DrawnMaskVertices, BackgroundVertices,
-		Tally.SaveLayerAsTextureCalls, Tally.SaveLayerAsMaskImageCalls));
+								 "drawn; mask shader: %d compiled, %d drawn; %d background vertices in the last frame; refusals: %u "
+								 "SaveLayerAsTexture, %u SaveLayerAsMaskImage"),
+		Sink->Buffers.Num(), CompiledShadowVertices, DrawnShadowVertices, CompiledMaskVertices, DrawnMaskVertices, CompiledShaders,
+		DrawnShaderCommands, BackgroundVertices, Tally.SaveLayerAsTextureCalls, Tally.SaveLayerAsMaskImageCalls));
 
 	TestTrue(TEXT("all three shadows reached the refusal"), Tally.SaveLayerAsTextureCalls >= 3);
 	TestTrue(TEXT("the mask reached its refusal"), Tally.SaveLayerAsMaskImageCalls >= 1);
 	TestTrue(TEXT("the shadow callback compiled shadow-coloured geometry"), CompiledShadowVertices > 0);
 	TestTrue(TEXT("the mask pass compiled mask-coloured geometry"), CompiledMaskVertices > 0);
+	TestTrue(TEXT("the other mask pass compiled its gradient shader"), CompiledShaders > 0);
 	TestTrue(TEXT("the elements still draw their own background"), BackgroundVertices > 0);
 
 	TestEqual(TEXT("no published frame draws the refused shadow texture's content"), DrawnShadowVertices, 0);
 	TestEqual(TEXT("no published frame draws the refused mask's artwork"), DrawnMaskVertices, 0);
+	TestEqual(TEXT("no published frame draws the refused mask's shader artwork"), DrawnShaderCommands, 0);
 
 	UIThread->EnqueueRemoveView(ViewId);
 	RunFrames(*UIThread, 1);
